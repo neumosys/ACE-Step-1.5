@@ -1,0 +1,118 @@
+# ACE-Step 1.5 RunPod Serverless Dockerfile
+# Optimized for GPU inference with optional LLM support
+
+FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04 AS base
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    TOKENIZERS_PARALLELISM=false
+
+# Install Python 3.11 and system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
+    python3-pip \
+    build-essential \
+    git \
+    curl \
+    wget \
+    ffmpeg \
+    libsndfile1 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3
+
+# Create and activate virtual environment
+RUN python3.11 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Create a non-root user
+RUN useradd -m -u 1001 appuser
+
+# Set working directory
+WORKDIR /app
+
+# Copy project files
+COPY . /app
+
+# Upgrade pip
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Install PyTorch with CUDA 12.8 support
+RUN pip install --no-cache-dir \
+    torch==2.10.0 \
+    torchaudio==2.10.0 \
+    torchvision \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# Install flash-attn for faster attention (requires torch first)
+RUN pip install --no-cache-dir flash-attn --no-build-isolation || echo "Flash attention installation failed, will use SDPA"
+
+# Install nano-vllm from local path (required for LLM)
+RUN pip install --no-cache-dir ./acestep/third_parts/nano-vllm
+
+# Install RunPod and AWS dependencies
+RUN pip install --no-cache-dir runpod boto3 hf_transfer
+
+# Install remaining dependencies (excluding torch which is already installed)
+RUN pip install --no-cache-dir \
+    "transformers>=4.51.0,<4.58.0" \
+    diffusers \
+    "scipy>=1.10.1" \
+    "soundfile>=0.13.1" \
+    "loguru>=0.7.3" \
+    "einops>=0.8.1" \
+    "accelerate>=1.12.0" \
+    "numba>=0.63.1" \
+    "vector-quantize-pytorch>=1.27.15" \
+    "peft>=0.7.0" \
+    torchao \
+    modelscope \
+    huggingface-hub \
+    requests \
+    diskcache \
+    PyYAML \
+    tqdm
+
+# Install torchcodec (for audio processing)
+RUN pip install --no-cache-dir "torchcodec>=0.9.1" || echo "torchcodec installation failed"
+
+# Install the package itself
+RUN pip install --no-cache-dir -e .
+
+# Create directories
+RUN mkdir -p /app/outputs /app/checkpoints /app/logs && \
+    chown -R appuser:appuser /app/outputs /app/checkpoints /app/logs
+
+# Change ownership
+RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
+
+# Expose port (for documentation)
+EXPOSE 8000
+
+# Volumes for checkpoints and outputs
+VOLUME [ "/app/checkpoints", "/app/outputs", "/app/logs" ]
+
+# Default environment variables (can be overridden at runtime)
+ENV CHECKPOINT_DIR=/app/checkpoints \
+    DIT_MODEL=acestep-v15-turbo \
+    LM_MODEL=acestep-5Hz-lm-1.7B \
+    LM_BACKEND=vllm \
+    DEVICE=cuda \
+    USE_FLASH_ATTENTION=true \
+    OFFLOAD_TO_CPU=false \
+    ENABLE_LLM=true
+
+# Run the handler
+CMD ["python", "-u", "handler_runpod.py"]
