@@ -27,12 +27,16 @@ print("Initializing ACE-Step 1.5 handlers...")
 
 # Get configuration from environment
 CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "/app/checkpoints")
-DIT_MODEL = os.environ.get("DIT_MODEL", "acestep-v15-turbo")
+DIT_MODEL_TURBO = os.environ.get("DIT_MODEL_TURBO", "acestep-v15-turbo")
+DIT_MODEL_BASE = os.environ.get("DIT_MODEL_BASE", "acestep-v15-base")
 LM_MODEL = os.environ.get("LM_MODEL", "acestep-5Hz-lm-1.7B")
 LM_BACKEND = os.environ.get("LM_BACKEND", "vllm")  # "vllm" or "pt"
 DEVICE = os.environ.get("DEVICE", "cuda")
 USE_FLASH_ATTENTION = os.environ.get("USE_FLASH_ATTENTION", "true").lower() == "true"
 OFFLOAD_TO_CPU = os.environ.get("OFFLOAD_TO_CPU", "false").lower() == "true"
+
+# Task types that require the base model (not supported by turbo)
+BASE_MODEL_TASKS = {"extract", "lego", "complete"}
 
 # Initialize DiT handler
 from acestep.handler import AceStepHandler
@@ -43,11 +47,51 @@ from acestep.constants import TASK_INSTRUCTIONS, TRACK_NAMES
 dit_handler = AceStepHandler()
 llm_handler = LLMHandler()
 
-# Initialize DiT model
-print(f"Initializing DiT model: {DIT_MODEL}")
+# Track currently loaded model
+current_dit_model = None
+
+def ensure_model_loaded(task_type: str) -> bool:
+    """
+    Ensure the correct model is loaded for the given task type.
+    Returns True if model is ready, False if loading failed.
+    """
+    global current_dit_model
+
+    # Determine which model is needed
+    needs_base = task_type in BASE_MODEL_TASKS
+    required_model = DIT_MODEL_BASE if needs_base else DIT_MODEL_TURBO
+
+    # Already loaded?
+    if current_dit_model == required_model:
+        return True
+
+    # Need to load/switch model
+    model_type = "base" if needs_base else "turbo"
+    print(f"Switching to {model_type} model ({required_model}) for task: {task_type}")
+
+    status, success = dit_handler.initialize_service(
+        project_root=CHECKPOINT_DIR,
+        config_path=required_model,
+        device=DEVICE,
+        use_flash_attention=USE_FLASH_ATTENTION,
+        compile_model=False,
+        offload_to_cpu=OFFLOAD_TO_CPU,
+        prefer_source="huggingface",
+    )
+
+    if success:
+        current_dit_model = required_model
+        print(f"Model switched successfully: {status}")
+        return True
+    else:
+        print(f"Failed to switch model: {status}")
+        return False
+
+# Initialize with turbo model by default
+print(f"Initializing DiT model: {DIT_MODEL_TURBO}")
 status, success = dit_handler.initialize_service(
     project_root=CHECKPOINT_DIR,
-    config_path=DIT_MODEL,
+    config_path=DIT_MODEL_TURBO,
     device=DEVICE,
     use_flash_attention=USE_FLASH_ATTENTION,
     compile_model=False,
@@ -57,6 +101,7 @@ status, success = dit_handler.initialize_service(
 print(f"DiT initialization: {status}")
 if not success:
     raise RuntimeError(f"Failed to initialize DiT model: {status}")
+current_dit_model = DIT_MODEL_TURBO
 
 # Initialize LLM handler (optional - can be disabled for faster startup)
 ENABLE_LLM = os.environ.get("ENABLE_LLM", "true").lower() == "true"
@@ -291,6 +336,10 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         # --- Extract Parameters ---
         # Task type
         task_type = job_input.get("task_type", "text2music")
+
+        # Ensure correct model is loaded for this task type
+        if not ensure_model_loaded(task_type):
+            return {"error": f"Failed to load required model for task type: {task_type}"}
 
         # Text inputs
         caption = job_input.get("caption", "")

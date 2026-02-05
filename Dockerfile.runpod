@@ -92,6 +92,13 @@ RUN pip install --no-cache-dir -e .
 RUN mkdir -p /app/outputs /app/checkpoints /app/logs && \
     chown -R appuser:appuser /app/outputs /app/checkpoints /app/logs
 
+# Pre-download models during build (baked into image for fast startup)
+# Download main model (includes turbo DiT, VAE, text encoder, LLM 1.7B)
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/Ace-Step1.5', local_dir='/app/checkpoints')"
+
+# Download base DiT model (for extract, lego, complete tasks)
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/acestep-v15-base', local_dir='/app/checkpoints/acestep-v15-base')"
+
 # Change ownership
 RUN chown -R appuser:appuser /app
 
@@ -101,12 +108,13 @@ USER appuser
 # Expose port (for documentation)
 EXPOSE 8000
 
-# Volumes for checkpoints and outputs
-VOLUME [ "/app/checkpoints", "/app/outputs", "/app/logs" ]
+# Volumes for outputs and logs only (checkpoints baked in)
+VOLUME [ "/app/outputs", "/app/logs" ]
 
 # Default environment variables (can be overridden at runtime)
 ENV CHECKPOINT_DIR=/app/checkpoints \
-    DIT_MODEL=acestep-v15-turbo \
+    DIT_MODEL_TURBO=acestep-v15-turbo \
+    DIT_MODEL_BASE=acestep-v15-base \
     LM_MODEL=acestep-5Hz-lm-1.7B \
     LM_BACKEND=vllm \
     DEVICE=cuda \
