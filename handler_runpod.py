@@ -37,7 +37,8 @@ OFFLOAD_TO_CPU = os.environ.get("OFFLOAD_TO_CPU", "false").lower() == "true"
 # Initialize DiT handler
 from acestep.handler import AceStepHandler
 from acestep.llm_inference import LLMHandler
-from acestep.inference import GenerationParams, GenerationConfig, generate_music
+from acestep.inference import GenerationParams, GenerationConfig, generate_music, understand_music
+from acestep.constants import TASK_INSTRUCTIONS, TRACK_NAMES
 
 dit_handler = AceStepHandler()
 llm_handler = LLMHandler()
@@ -113,6 +114,84 @@ def upload_to_s3(file_path: str, bucket: str, object_name: Optional[str] = None)
         return None
 
 
+def generate_instruction(
+    task_type: str,
+    track_name: Optional[str] = None,
+    complete_track_classes: Optional[List[str]] = None
+) -> str:
+    """Generate the appropriate instruction based on task type and parameters."""
+    if task_type == "text2music":
+        return TASK_INSTRUCTIONS["text2music"]
+    elif task_type == "repaint":
+        return TASK_INSTRUCTIONS["repaint"]
+    elif task_type == "cover":
+        return TASK_INSTRUCTIONS["cover"]
+    elif task_type == "extract":
+        if track_name:
+            return TASK_INSTRUCTIONS["extract"].format(TRACK_NAME=track_name.upper())
+        else:
+            return TASK_INSTRUCTIONS["extract_default"]
+    elif task_type == "lego":
+        if track_name:
+            return TASK_INSTRUCTIONS["lego"].format(TRACK_NAME=track_name.upper())
+        else:
+            return TASK_INSTRUCTIONS["lego_default"]
+    elif task_type == "complete":
+        if complete_track_classes and len(complete_track_classes) > 0:
+            track_classes_str = " | ".join(t.upper() for t in complete_track_classes)
+            return TASK_INSTRUCTIONS["complete"].format(TRACK_CLASSES=track_classes_str)
+        else:
+            return TASK_INSTRUCTIONS["complete_default"]
+    else:
+        return TASK_INSTRUCTIONS["text2music"]
+
+
+def mix_audio_files(source_path: str, generated_path: str, output_path: str, source_volume: float = 1.0, generated_volume: float = 1.0) -> bool:
+    """
+    Mix source audio with generated audio using ffmpeg.
+
+    Args:
+        source_path: Path to original/source audio file
+        generated_path: Path to generated audio file
+        output_path: Path for mixed output
+        source_volume: Volume multiplier for source (1.0 = original)
+        generated_volume: Volume multiplier for generated (1.0 = original)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    import subprocess
+
+    try:
+        # Use ffmpeg to mix two audio files
+        # amix filter combines audio streams, duration=longest ensures full length
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', source_path,
+            '-i', generated_path,
+            '-filter_complex',
+            f'[0:a]volume={source_volume}[a0];[1:a]volume={generated_volume}[a1];[a0][a1]amix=inputs=2:duration=longest:dropout_transition=0',
+            '-ac', '2',  # Stereo output
+            '-ar', '48000',  # 48kHz sample rate
+            output_path
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+        if result.returncode != 0:
+            logger.error(f"ffmpeg mixing failed: {result.stderr}")
+            return False
+
+        return True
+
+    except subprocess.TimeoutExpired:
+        logger.error("ffmpeg mixing timed out")
+        return False
+    except Exception as e:
+        logger.error(f"Error mixing audio: {e}")
+        return False
+
+
 def download_or_decode_audio(input_str: str, suffix: str = ".wav") -> Optional[str]:
     """
     Decode base64 string OR download from URL to a temporary file.
@@ -157,7 +236,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     RunPod handler function for ACE-Step 1.5.
 
     Input parameters:
-    - task_type: str = "text2music" (text2music, cover, repaint, lego, extract, complete)
+    - task_type: str = "text2music" (text2music, cover, repaint, lego, extract, complete, understand)
     - caption: str = "" (main prompt describing the music)
     - lyrics: str = "" (lyrics for the music, use "[Instrumental]" for instrumental)
     - instrumental: bool = False (force instrumental generation)
@@ -174,11 +253,25 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     - thinking: bool = True (enable LLM chain-of-thought reasoning)
     - lm_temperature: float = 0.85 (LLM sampling temperature)
     - reference_audio: str = None (URL or base64 for cover/style transfer)
-    - src_audio: str = None (URL or base64 for repaint/lego tasks)
-    - audio_codes: str = "" (pre-computed audio codes, advanced use)
-    - repainting_start: float = 0.0 (start time for repaint region)
-    - repainting_end: float = -1 (end time for repaint region, -1 for end)
+    - src_audio: str = None (URL or base64 for repaint/lego/extract/complete tasks)
+    - audio_codes: str = "" (pre-computed audio codes, for understand task or advanced use)
+    - repainting_start: float = 0.0 (start time for repaint/lego region)
+    - repainting_end: float = -1 (end time for repaint/lego region, -1 for end)
     - audio_cover_strength: float = 1.0 (reference audio influence, 0.0-1.0)
+    - track_name: str = None (for lego/extract tasks: vocals, drums, bass, guitar, keyboard, etc.)
+    - complete_track_classes: list = [] (for complete task: list of tracks to add, e.g., ["drums", "bass", "guitar"])
+    - auto_lrc: bool = False (generate LRC lyrics timestamps after generation)
+    - output_mode: str = "stems" (for lego/complete: "stems" returns new tracks only, "mixed" returns mixed with source)
+    - mix_volume_source: float = 1.0 (volume of source audio when mixing, 0.0-2.0)
+    - mix_volume_generated: float = 1.0 (volume of generated audio when mixing, 0.0-2.0)
+
+    Available track names for lego/extract/complete:
+    vocals, backing_vocals, drums, bass, guitar, keyboard, percussion, strings, synth, fx, brass, woodwinds
+
+    Task type "understand": Analyzes audio and extracts metadata (caption, lyrics, bpm, key, etc.)
+    - Accepts src_audio (URL or base64) which gets converted to audio codes internally
+    - Or accepts raw audio_codes directly (advanced use)
+    - Returns: caption, lyrics, bpm, duration, keyscale, language, timesignature
     """
     logger.info(f"Received event: {event}")
     job_input = event.get("input", {})
@@ -258,12 +351,69 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         repainting_end = float(job_input.get("repainting_end", -1))
         audio_cover_strength = float(job_input.get("audio_cover_strength", 1.0))
 
-        # Instruction (optional)
+        # Task-specific parameters for lego/extract/complete
+        track_name = job_input.get("track_name")
+        complete_track_classes = job_input.get("complete_track_classes", [])
+
+        # Auto LRC generation
+        auto_lrc = job_input.get("auto_lrc", False)
+
+        # Output mode for lego/complete tasks
+        output_mode = job_input.get("output_mode", "stems")  # "stems" or "mixed"
+        mix_volume_source = float(job_input.get("mix_volume_source", 1.0))
+        mix_volume_generated = float(job_input.get("mix_volume_generated", 1.0))
+
+        # Instruction - generate based on task type if not provided
         instruction = job_input.get("instruction", "")
+        if not instruction:
+            instruction = generate_instruction(task_type, track_name, complete_track_classes)
 
         # Validation
-        if task_type in ["cover", "repaint", "lego"] and not src_audio and not reference_audio:
+        if task_type in ["cover", "repaint", "lego", "extract", "complete"] and not src_audio and not reference_audio:
             return {"error": f"Task '{task_type}' requires 'src_audio' or 'reference_audio'."}
+
+        # Handle understand task separately (no audio generation)
+        if task_type == "understand":
+            if not ENABLE_LLM:
+                return {"error": "Understand task requires LLM to be enabled"}
+
+            # Get audio codes - either from direct input or by converting src_audio
+            codes_to_understand = audio_codes
+            if not codes_to_understand and src_audio:
+                logger.info("Converting src_audio to audio codes for understanding...")
+                codes_to_understand = dit_handler.convert_src_audio_to_codes(src_audio)
+                if codes_to_understand.startswith("❌"):
+                    return {"error": f"Failed to convert audio to codes: {codes_to_understand}"}
+
+            if not codes_to_understand:
+                return {"error": "Understand task requires 'src_audio' or 'audio_codes' parameter"}
+
+            logger.info("Starting understand task")
+            start_time = time.time()
+
+            result = understand_music(
+                llm_handler=llm_handler,
+                audio_codes=codes_to_understand,
+                temperature=lm_temperature,
+            )
+
+            end_time = time.time()
+
+            if not result.success:
+                return {"error": result.error or "Understand task failed"}
+
+            return {
+                "task_type": "understand",
+                "caption": result.caption,
+                "lyrics": result.lyrics,
+                "bpm": result.bpm,
+                "duration": result.duration,
+                "keyscale": result.keyscale,
+                "language": result.language,
+                "timesignature": result.timesignature,
+                "status_message": result.status_message,
+                "processing_time": end_time - start_time,
+            }
 
         logger.info(f"Starting generation for task: {task_type}")
         start_time = time.time()
@@ -298,7 +448,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             repainting_start=repainting_start,
             repainting_end=repainting_end,
             audio_cover_strength=audio_cover_strength,
-            instruction=instruction if instruction else "Fill the audio semantic mask based on the given conditions:",
+            instruction=instruction,
         )
 
         # Build GenerationConfig
@@ -329,23 +479,105 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         if not result.audios:
             return {"error": "No audio generated"}
 
+        # Mix with source audio if requested (for lego/complete tasks)
+        should_mix = (
+            output_mode == "mixed" and
+            task_type in ["lego", "complete"] and
+            src_audio is not None
+        )
+
+        if should_mix:
+            logger.info(f"Mixing generated audio with source (volumes: source={mix_volume_source}, generated={mix_volume_generated})")
+
         # Upload results to S3
         audio_urls = []
-        for audio in result.audios:
+        for idx, audio in enumerate(result.audios):
             audio_path = audio.get("path")
             if audio_path and os.path.exists(audio_path):
+                upload_path = audio_path
+
+                # Mix with source if requested
+                if should_mix:
+                    mixed_path = os.path.join(output_dir, f"mixed_{idx}.{audio_format}")
+                    if mix_audio_files(src_audio, audio_path, mixed_path, mix_volume_source, mix_volume_generated):
+                        upload_path = mixed_path
+                        temp_files.append(mixed_path)
+                        logger.info(f"Successfully mixed audio {idx}")
+                    else:
+                        logger.warning(f"Mixing failed for audio {idx}, uploading unmixed version")
+
                 file_name = f"{uuid.uuid4()}.{audio_format}"
-                s3_url = upload_to_s3(audio_path, S3_BUCKET_NAME, file_name)
+                s3_url = upload_to_s3(upload_path, S3_BUCKET_NAME, file_name)
                 if s3_url:
                     audio_urls.append({
                         "url": s3_url,
                         "key": audio.get("key"),
                         "seed": audio.get("params", {}).get("seed"),
                         "sample_rate": audio.get("sample_rate", 48000),
+                        "mixed": should_mix and upload_path != audio_path,
                     })
 
         if not audio_urls:
             return {"error": "Failed to upload to S3"}
+
+        # Generate LRC timestamps if requested
+        lrc_results = []
+        if auto_lrc and not instrumental:
+            extra_outputs = result.extra_outputs
+            pred_latents = extra_outputs.get("pred_latents")
+            encoder_hidden_states = extra_outputs.get("encoder_hidden_states")
+            encoder_attention_mask = extra_outputs.get("encoder_attention_mask")
+            context_latents = extra_outputs.get("context_latents")
+            lyric_token_idss = extra_outputs.get("lyric_token_idss")
+
+            if all(x is not None for x in [pred_latents, encoder_hidden_states, encoder_attention_mask, context_latents, lyric_token_idss]):
+                import torch
+                # Move tensors to device if needed
+                device = dit_handler.device if hasattr(dit_handler, 'device') else 'cuda'
+
+                for i in range(min(batch_size, pred_latents.shape[0])):
+                    try:
+                        # Calculate duration from latents (25 Hz latent rate)
+                        latent_length = pred_latents.shape[1]
+                        audio_duration = latent_length / 25.0
+
+                        # Get sample data
+                        sample_pred_latent = pred_latents[i:i+1].to(device)
+                        sample_encoder_hidden_states = encoder_hidden_states[i:i+1].to(device)
+                        sample_encoder_attention_mask = encoder_attention_mask[i:i+1].to(device)
+                        sample_context_latents = context_latents[i:i+1].to(device)
+                        sample_lyric_token_ids = lyric_token_idss[i:i+1].to(device)
+
+                        lrc_result = dit_handler.get_lyric_timestamp(
+                            pred_latent=sample_pred_latent,
+                            encoder_hidden_states=sample_encoder_hidden_states,
+                            encoder_attention_mask=sample_encoder_attention_mask,
+                            context_latents=sample_context_latents,
+                            lyric_token_ids=sample_lyric_token_ids,
+                            total_duration_seconds=float(audio_duration),
+                            vocal_language=vocal_language or "en",
+                            inference_steps=int(inference_steps),
+                            seed=42,
+                        )
+
+                        if lrc_result.get("success"):
+                            lrc_results.append({
+                                "lrc_text": lrc_result.get("lrc_text", ""),
+                                "sample_index": i,
+                            })
+                        else:
+                            lrc_results.append({
+                                "error": lrc_result.get("error", "Unknown error"),
+                                "sample_index": i,
+                            })
+                    except Exception as e:
+                        logger.warning(f"Failed to generate LRC for sample {i}: {e}")
+                        lrc_results.append({
+                            "error": str(e),
+                            "sample_index": i,
+                        })
+            else:
+                logger.warning("LRC generation requested but required tensors not available")
 
         # Build response
         response = {
@@ -355,7 +587,12 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             "task_type": task_type,
             "generation_time": generation_time,
             "status_message": result.status_message,
+            "output_mode": "mixed" if should_mix else "stems",
         }
+
+        # Add LRC results if generated
+        if lrc_results:
+            response["lrc"] = lrc_results
 
         # Add metadata from LLM if available
         if result.extra_outputs.get("lm_metadata"):
