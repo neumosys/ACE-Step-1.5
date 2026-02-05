@@ -357,6 +357,15 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
         # Generation parameters
         inference_steps = int(job_input.get("inference_steps", 8))
+
+        # IMPORTANT: Base model tasks (complete, lego, extract) require more inference steps
+        # The default of 8 is for turbo model; base model needs 32-100 (typically 50)
+        # If user didn't explicitly set inference_steps and task is a base model task,
+        # automatically increase to 50 for proper audio quality
+        if task_type in BASE_MODEL_TASKS and inference_steps <= 8:
+            logger.info(f"Auto-adjusting inference_steps from {inference_steps} to 50 for base model task '{task_type}'")
+            inference_steps = 50
+
         guidance_scale = float(job_input.get("guidance_scale", 7.0))
         seed = int(job_input.get("seed", -1))
         batch_size = int(job_input.get("batch_size", 1))

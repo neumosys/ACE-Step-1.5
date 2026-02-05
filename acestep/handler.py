@@ -1414,10 +1414,10 @@ class AceStepHandler:
         return captions_batch, instructions_batch, lyrics_batch, vocal_languages_batch, metas_batch
     
     def determine_task_type(self, task_type, audio_code_string):
-        # Determine task type - repaint, lego, and complete tasks can have repainting parameters
+        # Determine task type - repaint and lego tasks can have repainting parameters
+        # Other tasks (cover, text2music, extract, complete) should NOT have repainting
         is_repaint_task = (task_type == "repaint")
         is_lego_task = (task_type == "lego")
-        is_complete_task = (task_type == "complete")
         is_cover_task = (task_type == "cover")
 
         has_codes = False
@@ -1428,10 +1428,9 @@ class AceStepHandler:
 
         if has_codes:
             is_cover_task = True
-        # Repaint, lego, and complete tasks can use repainting parameters for chunk mask
-        # Complete task works similarly to lego - it adds tracks to source audio
-        can_use_repainting = is_repaint_task or is_lego_task or is_complete_task
-        return is_repaint_task, is_lego_task, is_cover_task, can_use_repainting, is_complete_task
+        # Both repaint and lego tasks can use repainting parameters for chunk mask
+        can_use_repainting = is_repaint_task or is_lego_task
+        return is_repaint_task, is_lego_task, is_cover_task, can_use_repainting
 
     def create_target_wavs(self, duration_seconds: float) -> torch.Tensor:
         try:
@@ -1458,7 +1457,6 @@ class AceStepHandler:
         is_lego_task,
         is_cover_task,
         can_use_repainting,
-        is_complete_task=False,
     ):
         target_wavs_batch = []
         # Store padding info for each batch item to adjust repainting coordinates
@@ -1472,8 +1470,8 @@ class AceStepHandler:
                         'left_padding_duration': 0.0,
                         'right_padding_duration': 0.0
                     })
-                elif is_repaint_task or is_lego_task or is_complete_task:
-                    # Repaint/lego/complete task: May need padding for outpainting
+                elif is_repaint_task or is_lego_task:
+                    # Repaint/lego task: May need padding for outpainting
                     src_audio_duration = processed_src_audio.shape[-1] / 48000.0
 
                     # Determine actual end time
@@ -2842,7 +2840,7 @@ class AceStepHandler:
                 time_signature
             )
             
-            is_repaint_task, is_lego_task, is_cover_task, can_use_repainting, is_complete_task = self.determine_task_type(task_type, audio_code_string)
+            is_repaint_task, is_lego_task, is_cover_task, can_use_repainting = self.determine_task_type(task_type, audio_code_string)
             
             repainting_start_batch, repainting_end_batch, target_wavs_tensor = self.prepare_padding_info(
                 actual_batch_size,
@@ -2853,8 +2851,7 @@ class AceStepHandler:
                 is_repaint_task,
                 is_lego_task,
                 is_cover_task,
-                can_use_repainting,
-                is_complete_task,
+                can_use_repainting
             )
             
             progress(0.52, desc=f"Generating music (batch size: {actual_batch_size})...")

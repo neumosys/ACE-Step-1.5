@@ -85,7 +85,7 @@ docker push your-username/ace-step-1.5:latest
 
 | Parameter         | Type   | Default  | Description                                    |
 | ----------------- | ------ | -------- | ---------------------------------------------- |
-| `inference_steps` | int    | `8`      | Diffusion steps (8 for turbo, 32-100 for base) |
+| `inference_steps` | int    | `8`      | Diffusion steps (8 for turbo, 32-100 for base). **Auto-adjusted to 50 for base model tasks (extract, lego, complete) if set to 8 or less** |
 | `guidance_scale`  | float  | `7.0`    | CFG strength                                   |
 | `seed`            | int    | `-1`     | Seed for reproducibility (-1 for random)       |
 | `batch_size`      | int    | `1`      | Number of samples to generate (1-8)            |
@@ -310,3 +310,10 @@ python test_handler_runpod.py \
 
 - Set `USE_FLASH_ATTENTION=false` to use SDPA instead
 - Ensure CUDA version matches (12.8 recommended)
+
+### Complete/Lego/Extract Task Output is Noise
+
+- These tasks use the **base model** which requires more inference steps
+- The handler auto-adjusts `inference_steps` to 50 when using base model tasks
+- If you override `inference_steps`, ensure it's 32-100 for base model tasks (not 8)
+- Example: `"inference_steps": 50` for complete/lego/extract tasks
