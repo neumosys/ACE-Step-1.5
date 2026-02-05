@@ -373,6 +373,13 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
         # LLM parameters
         thinking = job_input.get("thinking", True) if ENABLE_LLM else False
+
+        # IMPORTANT: Disable thinking (LLM audio code generation) for tasks that use src_audio directly.
+        # When thinking=True, LLM generates audio codes which causes src_audio to be ignored in handler.py.
+        # For complete/lego/extract tasks, we need the actual source audio, not LLM-generated codes.
+        if task_type in BASE_MODEL_TASKS:
+            thinking = False
+
         lm_temperature = float(job_input.get("lm_temperature", 0.85))
         lm_cfg_scale = float(job_input.get("lm_cfg_scale", 2.0))
         use_cot_metas = job_input.get("use_cot_metas", True)
