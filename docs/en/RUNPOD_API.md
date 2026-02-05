@@ -24,16 +24,18 @@ Complete API reference for the ACE-Step 1.5 RunPod serverless endpoint.
 The ACE-Step 1.5 API provides AI-powered music generation through RunPod serverless endpoints. All requests are sent as JSON with an `input` object containing parameters.
 
 **Base Request Format:**
+
 ```json
 {
   "input": {
-    "task_type": "text2music",
+    "task_type": "text2music"
     // ... other parameters
   }
 }
 ```
 
 **Audio Input Formats:**
+
 - `src_audio` and `reference_audio` accept:
   - HTTP/HTTPS URLs to audio files
   - Base64-encoded audio data
@@ -65,6 +67,7 @@ Generate music from scratch using text prompts.
 | `auto_lrc` | bool | false | Generate LRC lyrics timestamps |
 
 **Example Request:**
+
 ```json
 {
   "input": {
@@ -82,6 +85,7 @@ Generate music from scratch using text prompts.
 ```
 
 **Example Response:**
+
 ```json
 {
   "audios": [
@@ -135,6 +139,7 @@ Create a cover version of an existing song, preserving structure but changing st
 | `reference_audio` | string | null | Additional style reference audio |
 
 **Example Request:**
+
 ```json
 {
   "input": {
@@ -167,6 +172,7 @@ Replace a specific time region of audio with new generated content.
 | `repainting_end` | float | -1 | End time in seconds (-1 for end of file) |
 
 **Example Request:**
+
 ```json
 {
   "input": {
@@ -204,6 +210,7 @@ Add a single instrument track to existing audio. Like stacking Lego blocks.
 | `mix_volume_generated` | float | 1.0 | Generated track volume when mixing (0.0-2.0) |
 
 **Example Request (stems only):**
+
 ```json
 {
   "input": {
@@ -216,6 +223,7 @@ Add a single instrument track to existing audio. Like stacking Lego blocks.
 ```
 
 **Example Request (pre-mixed output):**
+
 ```json
 {
   "input": {
@@ -245,6 +253,7 @@ Extract/isolate a specific instrument track from mixed audio (stem separation).
 | `track_name` | string | Which instrument to extract (see [Track Names](#track-names)) |
 
 **Example Request:**
+
 ```json
 {
   "input": {
@@ -278,6 +287,7 @@ Add multiple instrument tracks to existing audio at once.
 | `mix_volume_generated` | float | 1.0 | Generated tracks volume when mixing (0.0-2.0) |
 
 **Example Request (stems only):**
+
 ```json
 {
   "input": {
@@ -290,6 +300,7 @@ Add multiple instrument tracks to existing audio at once.
 ```
 
 **Example Request (pre-mixed full song):**
+
 ```json
 {
   "input": {
@@ -321,6 +332,7 @@ Analyze audio and extract metadata including caption, lyrics, BPM, key, etc.
 | `lm_temperature` | float | 0.85 | Creativity of analysis (lower = more deterministic) |
 
 **Example Request:**
+
 ```json
 {
   "input": {
@@ -331,6 +343,7 @@ Analyze audio and extract metadata including caption, lyrics, BPM, key, etc.
 ```
 
 **Example Response:**
+
 ```json
 {
   "task_type": "understand",
@@ -352,59 +365,66 @@ Analyze audio and extract metadata including caption, lyrics, BPM, key, etc.
 These parameters work with all generation tasks (not `understand`):
 
 ### Text & Content
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `caption` | string | "" | Main prompt describing the music |
-| `lyrics` | string | "" | Lyrics (use `[Instrumental]` for instrumental) |
-| `instrumental` | bool | false | Force instrumental generation |
-| `vocal_language` | string | "unknown" | Language code: en, zh, ja, ko, etc. |
+
+| Parameter        | Type   | Default   | Description                                    |
+| ---------------- | ------ | --------- | ---------------------------------------------- |
+| `caption`        | string | ""        | Main prompt describing the music               |
+| `lyrics`         | string | ""        | Lyrics (use `[Instrumental]` for instrumental) |
+| `instrumental`   | bool   | false     | Force instrumental generation                  |
+| `vocal_language` | string | "unknown" | Language code: en, zh, ja, ko, etc.            |
 
 ### Music Metadata
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `duration` | float | -1 | Target duration in seconds (-1 for auto, max ~600) |
-| `bpm` | int | null | Beats per minute (null for auto, range 30-300) |
-| `keyscale` | string | "" | Musical key (e.g., "C Major", "F# minor") |
-| `timesignature` | string | "" | Time signature: "2", "3", "4", or "6" |
+
+| Parameter       | Type   | Default | Description                                        |
+| --------------- | ------ | ------- | -------------------------------------------------- |
+| `duration`      | float  | -1      | Target duration in seconds (-1 for auto, max ~600) |
+| `bpm`           | int    | null    | Beats per minute (null for auto, range 30-300)     |
+| `keyscale`      | string | ""      | Musical key (e.g., "C Major", "F# minor")          |
+| `timesignature` | string | ""      | Time signature: "2", "3", "4", or "6"              |
 
 ### Generation Settings
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `inference_steps` | int | 8 | Diffusion steps (8 for turbo, 32-100 for base) |
-| `guidance_scale` | float | 7.0 | CFG strength (higher = follow prompt more) |
-| `seed` | int | -1 | Random seed (-1 for random) |
-| `batch_size` | int | 1 | Number of variations to generate |
-| `audio_format` | string | "flac" | Output format: mp3, wav, flac |
+
+| Parameter         | Type   | Default | Description                                    |
+| ----------------- | ------ | ------- | ---------------------------------------------- |
+| `inference_steps` | int    | 8       | Diffusion steps (8 for turbo, 32-100 for base) |
+| `guidance_scale`  | float  | 7.0     | CFG strength (higher = follow prompt more)     |
+| `seed`            | int    | -1      | Random seed (-1 for random)                    |
+| `batch_size`      | int    | 1       | Number of variations to generate               |
+| `audio_format`    | string | "flac"  | Output format: mp3, wav, flac                  |
 
 ### LLM Settings
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `thinking` | bool | true | Enable chain-of-thought reasoning |
-| `lm_temperature` | float | 0.85 | LLM creativity (0.0-2.0) |
-| `use_cot_metas` | bool | true | Let LLM detect BPM/key |
-| `use_cot_caption` | bool | true | Let LLM enhance caption |
-| `use_cot_language` | bool | true | Let LLM detect language |
+
+| Parameter          | Type  | Default | Description                       |
+| ------------------ | ----- | ------- | --------------------------------- |
+| `thinking`         | bool  | true    | Enable chain-of-thought reasoning |
+| `lm_temperature`   | float | 0.85    | LLM creativity (0.0-2.0)          |
+| `use_cot_metas`    | bool  | true    | Let LLM detect BPM/key            |
+| `use_cot_caption`  | bool  | true    | Let LLM enhance caption           |
+| `use_cot_language` | bool  | true    | Let LLM detect language           |
 
 ### Advanced
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `auto_lrc` | bool | false | Generate LRC lyrics timestamps |
-| `use_adg` | bool | false | Adaptive Dual Guidance (base model only) |
-| `shift` | float | 1.0 | Timestep shift factor |
-| `instruction` | string | "" | Custom instruction (auto-generated if empty) |
+
+| Parameter     | Type   | Default | Description                                  |
+| ------------- | ------ | ------- | -------------------------------------------- |
+| `auto_lrc`    | bool   | false   | Generate LRC lyrics timestamps               |
+| `use_adg`     | bool   | false   | Adaptive Dual Guidance (base model only)     |
+| `shift`       | float  | 1.0     | Timestep shift factor                        |
+| `instruction` | string | ""      | Custom instruction (auto-generated if empty) |
 
 ### Output Mode (lego/complete tasks)
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `output_mode` | string | "stems" | `"stems"` = new tracks only, `"mixed"` = mixed with source |
-| `mix_volume_source` | float | 1.0 | Volume of source audio when mixing (0.0-2.0) |
-| `mix_volume_generated` | float | 1.0 | Volume of generated audio when mixing (0.0-2.0) |
+
+| Parameter              | Type   | Default | Description                                                |
+| ---------------------- | ------ | ------- | ---------------------------------------------------------- |
+| `output_mode`          | string | "stems" | `"stems"` = new tracks only, `"mixed"` = mixed with source |
+| `mix_volume_source`    | float  | 1.0     | Volume of source audio when mixing (0.0-2.0)               |
+| `mix_volume_generated` | float  | 1.0     | Volume of generated audio when mixing (0.0-2.0)            |
 
 ---
 
 ## Response Format
 
 ### Generation Tasks Response
+
 ```json
 {
   "audios": [
@@ -413,13 +433,13 @@ These parameters work with all generation tasks (not `understand`):
       "key": "sample_0",
       "seed": 12345,
       "sample_rate": 48000,
-      "mixed": false  // true if output_mode="mixed" was used
+      "mixed": false // true if output_mode="mixed" was used
     }
   ],
-  "audio_url": "https://...",  // First audio URL for convenience
+  "audio_url": "https://...", // First audio URL for convenience
   "format": "flac",
   "task_type": "text2music",
-  "output_mode": "stems",  // "stems" or "mixed"
+  "output_mode": "stems", // "stems" or "mixed"
   "generation_time": 45.2,
   "status_message": "Generation complete",
   "lm_metadata": {
@@ -428,7 +448,8 @@ These parameters work with all generation tasks (not `understand`):
     "duration": 120,
     "caption": "Enhanced caption..."
   },
-  "lrc": [  // Only if auto_lrc=true
+  "lrc": [
+    // Only if auto_lrc=true
     {
       "lrc_text": "[00:05.23]Line one\n[00:10.45]Line two",
       "sample_index": 0
@@ -442,6 +463,7 @@ These parameters work with all generation tasks (not `understand`):
 ```
 
 ### Understand Task Response
+
 ```json
 {
   "task_type": "understand",
@@ -457,6 +479,7 @@ These parameters work with all generation tasks (not `understand`):
 ```
 
 ### Error Response
+
 ```json
 {
   "error": "Error message describing what went wrong"
@@ -469,20 +492,20 @@ These parameters work with all generation tasks (not `understand`):
 
 Available track names for `lego`, `extract`, and `complete` tasks:
 
-| Track Name | Description |
-|------------|-------------|
-| `vocals` | Lead vocals |
+| Track Name       | Description               |
+| ---------------- | ------------------------- |
+| `vocals`         | Lead vocals               |
 | `backing_vocals` | Background/harmony vocals |
-| `drums` | Drum kit |
-| `bass` | Bass guitar/synth bass |
-| `guitar` | Electric/acoustic guitar |
-| `keyboard` | Piano, organ, synth pads |
-| `percussion` | Auxiliary percussion |
-| `strings` | Orchestral strings |
-| `synth` | Synthesizers |
-| `fx` | Sound effects |
-| `brass` | Brass instruments |
-| `woodwinds` | Woodwind instruments |
+| `drums`          | Drum kit                  |
+| `bass`           | Bass guitar/synth bass    |
+| `guitar`         | Electric/acoustic guitar  |
+| `keyboard`       | Piano, organ, synth pads  |
+| `percussion`     | Auxiliary percussion      |
+| `strings`        | Orchestral strings        |
+| `synth`          | Synthesizers              |
+| `fx`             | Sound effects             |
+| `brass`          | Brass instruments         |
+| `woodwinds`      | Woodwind instruments      |
 
 ---
 
@@ -490,10 +513,10 @@ Available track names for `lego`, `extract`, and `complete` tasks:
 
 The model is configured via environment variables on the RunPod endpoint:
 
-| Variable | Options | Description |
-|----------|---------|-------------|
-| `DIT_MODEL` | `acestep-v15-turbo`, `acestep-v15-base` | Turbo (8 steps, fast) or Base (32-100 steps, higher quality) |
-| `ENABLE_LLM` | `true`, `false` | Enable/disable LLM reasoning |
+| Variable     | Options                                 | Description                                                  |
+| ------------ | --------------------------------------- | ------------------------------------------------------------ |
+| `DIT_MODEL`  | `acestep-v15-turbo`, `acestep-v15-base` | Turbo (8 steps, fast) or Base (32-100 steps, higher quality) |
+| `ENABLE_LLM` | `true`, `false`                         | Enable/disable LLM reasoning                                 |
 
 **Note:** Some tasks (`lego`, `extract`, `complete`) are only available with the Base model.
 
@@ -502,6 +525,7 @@ The model is configured via environment variables on the RunPod endpoint:
 ## Examples
 
 ### Generate Instrumental Track
+
 ```json
 {
   "input": {
@@ -515,6 +539,7 @@ The model is configured via environment variables on the RunPod endpoint:
 ```
 
 ### Create Karaoke Version (Remove Vocals)
+
 ```json
 {
   "input": {
@@ -524,27 +549,42 @@ The model is configured via environment variables on the RunPod endpoint:
   }
 }
 ```
+
 Then subtract the extracted vocals from the original to get instrumental.
 
 ### Add Full Band to Vocals (Stems Only)
+
 ```json
 {
   "input": {
     "task_type": "complete",
     "src_audio": "https://example.com/vocals.mp3",
-    "complete_track_classes": ["drums", "bass", "guitar", "keyboard", "strings"],
+    "complete_track_classes": [
+      "drums",
+      "bass",
+      "guitar",
+      "keyboard",
+      "strings"
+    ],
     "caption": "Epic pop ballad arrangement with emotional strings and powerful drums"
   }
 }
 ```
 
 ### Add Full Band to Vocals (Pre-Mixed Output)
+
 ```json
 {
   "input": {
     "task_type": "complete",
     "src_audio": "https://example.com/vocals.mp3",
-    "complete_track_classes": ["drums", "bass", "guitar", "keyboard", "strings"],
+    "complete_track_classes": [
+      "drums",
+      "bass",
+      "guitar",
+      "keyboard",
+      "strings"
+    ],
     "caption": "Epic pop ballad arrangement with emotional strings and powerful drums",
     "output_mode": "mixed",
     "mix_volume_source": 1.0,
@@ -554,6 +594,7 @@ Then subtract the extracted vocals from the original to get instrumental.
 ```
 
 ### Analyze Unknown Song
+
 ```json
 {
   "input": {
