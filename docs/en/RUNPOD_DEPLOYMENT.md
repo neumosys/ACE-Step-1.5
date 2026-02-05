@@ -37,26 +37,26 @@ docker push your-username/ace-step-1.5:latest
 
 ### Required
 
-| Variable | Description |
-|----------|-------------|
-| `S3_BUCKET_NAME` | S3 bucket for audio uploads |
-| `AWS_ACCESS_KEY_ID` | AWS access key |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret key |
+| Variable                | Description                 |
+| ----------------------- | --------------------------- |
+| `S3_BUCKET_NAME`        | S3 bucket for audio uploads |
+| `AWS_ACCESS_KEY_ID`     | AWS access key              |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret key              |
 
 ### Optional
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AWS_REGION` | `us-east-1` | AWS region |
-| `S3_ENDPOINT_URL` | (none) | Custom S3 endpoint (for R2, MinIO, etc.) |
-| `CHECKPOINT_DIR` | `/app/checkpoints` | Model checkpoints directory |
-| `DIT_MODEL` | `acestep-v15-turbo` | DiT model to use |
-| `LM_MODEL` | `acestep-5Hz-lm-1.7B` | LLM model to use |
-| `LM_BACKEND` | `vllm` | LLM backend (`vllm` or `pt`) |
-| `DEVICE` | `cuda` | Device (`cuda`, `cpu`, or `auto`) |
-| `USE_FLASH_ATTENTION` | `true` | Enable flash attention |
-| `OFFLOAD_TO_CPU` | `false` | Offload models to CPU when not in use |
-| `ENABLE_LLM` | `true` | Enable LLM (set `false` for faster startup) |
+| Variable              | Default               | Description                                 |
+| --------------------- | --------------------- | ------------------------------------------- |
+| `AWS_REGION`          | `us-east-1`           | AWS region                                  |
+| `S3_ENDPOINT_URL`     | (none)                | Custom S3 endpoint (for R2, MinIO, etc.)    |
+| `CHECKPOINT_DIR`      | `/app/checkpoints`    | Model checkpoints directory                 |
+| `DIT_MODEL`           | `acestep-v15-turbo`   | DiT model to use                            |
+| `LM_MODEL`            | `acestep-5Hz-lm-1.7B` | LLM model to use                            |
+| `LM_BACKEND`          | `vllm`                | LLM backend (`vllm` or `pt`)                |
+| `DEVICE`              | `cuda`                | Device (`cuda`, `cpu`, or `auto`)           |
+| `USE_FLASH_ATTENTION` | `true`                | Enable flash attention                      |
+| `OFFLOAD_TO_CPU`      | `false`               | Offload models to CPU when not in use       |
+| `ENABLE_LLM`          | `true`                | Enable LLM (set `false` for faster startup) |
 
 ## API Reference
 
@@ -64,63 +64,63 @@ docker push your-username/ace-step-1.5:latest
 
 #### Core Parameters
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `task_type` | string | `"text2music"` | Task type: `text2music`, `cover`, `repaint`, `lego`, `extract`, `complete` |
-| `caption` | string | `""` | Main prompt describing the music (< 512 chars) |
-| `lyrics` | string | `""` | Lyrics for the music, use `"[Instrumental]"` for instrumental (< 4096 chars) |
-| `instrumental` | bool | `false` | Force instrumental generation |
+| Parameter      | Type   | Default        | Description                                                                  |
+| -------------- | ------ | -------------- | ---------------------------------------------------------------------------- |
+| `task_type`    | string | `"text2music"` | Task type: `text2music`, `cover`, `repaint`, `lego`, `extract`, `complete`   |
+| `caption`      | string | `""`           | Main prompt describing the music (< 512 chars)                               |
+| `lyrics`       | string | `""`           | Lyrics for the music, use `"[Instrumental]"` for instrumental (< 4096 chars) |
+| `instrumental` | bool   | `false`        | Force instrumental generation                                                |
 
 #### Music Metadata
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `duration` | float | `-1` | Target duration in seconds (10-600, -1 for auto) |
-| `bpm` | int | `null` | BPM (30-300, null for auto) |
-| `keyscale` | string | `""` | Musical key (e.g., `"C Major"`, `"Am"`) |
-| `timesignature` | string | `""` | Time signature: `"2"`, `"3"`, `"4"`, or `"6"` |
-| `vocal_language` | string | `"unknown"` | Language code: `en`, `zh`, `ja`, etc. |
+| Parameter        | Type   | Default     | Description                                      |
+| ---------------- | ------ | ----------- | ------------------------------------------------ |
+| `duration`       | float  | `-1`        | Target duration in seconds (10-600, -1 for auto) |
+| `bpm`            | int    | `null`      | BPM (30-300, null for auto)                      |
+| `keyscale`       | string | `""`        | Musical key (e.g., `"C Major"`, `"Am"`)          |
+| `timesignature`  | string | `""`        | Time signature: `"2"`, `"3"`, `"4"`, or `"6"`    |
+| `vocal_language` | string | `"unknown"` | Language code: `en`, `zh`, `ja`, etc.            |
 
 #### Generation Parameters
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `inference_steps` | int | `8` | Diffusion steps (8 for turbo, 32-100 for base) |
-| `guidance_scale` | float | `7.0` | CFG strength |
-| `seed` | int | `-1` | Seed for reproducibility (-1 for random) |
-| `batch_size` | int | `1` | Number of samples to generate (1-8) |
-| `audio_format` | string | `"flac"` | Output format: `mp3`, `wav`, `flac` |
+| Parameter         | Type   | Default  | Description                                    |
+| ----------------- | ------ | -------- | ---------------------------------------------- |
+| `inference_steps` | int    | `8`      | Diffusion steps (8 for turbo, 32-100 for base) |
+| `guidance_scale`  | float  | `7.0`    | CFG strength                                   |
+| `seed`            | int    | `-1`     | Seed for reproducibility (-1 for random)       |
+| `batch_size`      | int    | `1`      | Number of samples to generate (1-8)            |
+| `audio_format`    | string | `"flac"` | Output format: `mp3`, `wav`, `flac`            |
 
 #### LLM Parameters
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `thinking` | bool | `true` | Enable LLM chain-of-thought reasoning |
-| `lm_temperature` | float | `0.85` | LLM sampling temperature (0.0-2.0) |
-| `lm_cfg_scale` | float | `2.0` | LLM CFG scale |
-| `use_cot_metas` | bool | `true` | Let LLM generate music metadata |
-| `use_cot_caption` | bool | `true` | Let LLM enhance caption |
-| `use_cot_language` | bool | `true` | Let LLM detect language |
+| Parameter          | Type  | Default | Description                           |
+| ------------------ | ----- | ------- | ------------------------------------- |
+| `thinking`         | bool  | `true`  | Enable LLM chain-of-thought reasoning |
+| `lm_temperature`   | float | `0.85`  | LLM sampling temperature (0.0-2.0)    |
+| `lm_cfg_scale`     | float | `2.0`   | LLM CFG scale                         |
+| `use_cot_metas`    | bool  | `true`  | Let LLM generate music metadata       |
+| `use_cot_caption`  | bool  | `true`  | Let LLM enhance caption               |
+| `use_cot_language` | bool  | `true`  | Let LLM detect language               |
 
 #### Advanced DiT Parameters
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `use_adg` | bool | `false` | Use Adaptive Dual Guidance (base model only) |
-| `cfg_interval_start` | float | `0.0` | CFG start ratio (0.0-1.0) |
-| `cfg_interval_end` | float | `1.0` | CFG end ratio (0.0-1.0) |
-| `shift` | float | `1.0` | Timestep shift factor |
+| Parameter            | Type  | Default | Description                                  |
+| -------------------- | ----- | ------- | -------------------------------------------- |
+| `use_adg`            | bool  | `false` | Use Adaptive Dual Guidance (base model only) |
+| `cfg_interval_start` | float | `0.0`   | CFG start ratio (0.0-1.0)                    |
+| `cfg_interval_end`   | float | `1.0`   | CFG end ratio (0.0-1.0)                      |
+| `shift`              | float | `1.0`   | Timestep shift factor                        |
 
 #### Audio-to-Audio Parameters
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `reference_audio` | string | `null` | Reference audio (URL or base64) for cover/style transfer |
-| `src_audio` | string | `null` | Source audio (URL or base64) for repaint/lego tasks |
-| `audio_codes` | string | `""` | Pre-computed audio codes (advanced) |
-| `repainting_start` | float | `0.0` | Start time for repaint region (seconds) |
-| `repainting_end` | float | `-1` | End time for repaint region (-1 for end) |
-| `audio_cover_strength` | float | `1.0` | Reference audio influence (0.0-1.0) |
+| Parameter              | Type   | Default | Description                                              |
+| ---------------------- | ------ | ------- | -------------------------------------------------------- |
+| `reference_audio`      | string | `null`  | Reference audio (URL or base64) for cover/style transfer |
+| `src_audio`            | string | `null`  | Source audio (URL or base64) for repaint/lego tasks      |
+| `audio_codes`          | string | `""`    | Pre-computed audio codes (advanced)                      |
+| `repainting_start`     | float  | `0.0`   | Start time for repaint region (seconds)                  |
+| `repainting_end`       | float  | `-1`    | End time for repaint region (-1 for end)                 |
+| `audio_cover_strength` | float  | `1.0`   | Reference audio influence (0.0-1.0)                      |
 
 ### Output Format
 
@@ -244,21 +244,21 @@ docker push your-username/ace-step-1.5:latest
 
 ### DiT Models
 
-| Model | Description | Steps |
-|-------|-------------|-------|
-| `acestep-v15-turbo` | Fast generation (default) | 8 |
-| `acestep-v15-turbo-shift1` | Turbo with shift=1 | 8 |
-| `acestep-v15-turbo-shift3` | Turbo with shift=3 | 8 |
-| `acestep-v15-base` | High quality, slower | 32-100 |
-| `acestep-v15-sft` | Supervised fine-tuned | 32-100 |
+| Model                      | Description               | Steps  |
+| -------------------------- | ------------------------- | ------ |
+| `acestep-v15-turbo`        | Fast generation (default) | 8      |
+| `acestep-v15-turbo-shift1` | Turbo with shift=1        | 8      |
+| `acestep-v15-turbo-shift3` | Turbo with shift=3        | 8      |
+| `acestep-v15-base`         | High quality, slower      | 32-100 |
+| `acestep-v15-sft`          | Supervised fine-tuned     | 32-100 |
 
 ### LLM Models
 
-| Model | Description | VRAM |
-|-------|-------------|------|
-| `acestep-5Hz-lm-0.6B` | Lightweight | ~2GB |
-| `acestep-5Hz-lm-1.7B` | Balanced (default) | ~4GB |
-| `acestep-5Hz-lm-4B` | Premium quality | ~10GB |
+| Model                 | Description        | VRAM  |
+| --------------------- | ------------------ | ----- |
+| `acestep-5Hz-lm-0.6B` | Lightweight        | ~2GB  |
+| `acestep-5Hz-lm-1.7B` | Balanced (default) | ~4GB  |
+| `acestep-5Hz-lm-4B`   | Premium quality    | ~10GB |
 
 ## Local Testing
 
@@ -284,12 +284,12 @@ python test_handler_runpod.py \
 
 ## GPU Requirements
 
-| Configuration | Minimum VRAM | Recommended |
-|--------------|--------------|-------------|
-| DiT-only (turbo) | 8GB | RTX 3090+ |
-| DiT + LLM 0.6B | 12GB | RTX 4080+ |
-| DiT + LLM 1.7B | 16GB | RTX 4090 |
-| DiT + LLM 4B | 24GB+ | A100/H100 |
+| Configuration    | Minimum VRAM | Recommended |
+| ---------------- | ------------ | ----------- |
+| DiT-only (turbo) | 8GB          | RTX 3090+   |
+| DiT + LLM 0.6B   | 12GB         | RTX 4080+   |
+| DiT + LLM 1.7B   | 16GB         | RTX 4090    |
+| DiT + LLM 4B     | 24GB+        | A100/H100   |
 
 ## Troubleshooting
 
