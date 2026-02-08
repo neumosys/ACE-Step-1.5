@@ -75,6 +75,92 @@ Star ACE-Step on GitHub and be instantly notified of new releases
 
 > **Requirements:** Python 3.11, CUDA GPU recommended (works on CPU/MPS but slower)
 
+### CPU Support (Limited)
+
+ACE-Step can run on CPU for **inference only**, but performance will be significantly slower.
+
+- CPU inference is supported for testing and experimentation.
+- **Training (including LoRA) on CPU is not recommended** due to extremely long runtimes.
+- For low-VRAM systems, DiT-only mode (LLM disabled) is supported.
+- While CPU training may technically run, it is not practically usable due to extremely long runtimes; **for any practical training workflow, a CUDA-capable GPU or cloud GPU instance is required.**
+
+If you do not have a CUDA GPU, consider:
+- Using cloud GPU providers
+- Running inference-only workflows
+- Using DiT-only mode with `ACESTEP_INIT_LLM=false`
+
+### AMD / ROCm GPUs
+
+ACE-Step works with AMD GPUs via PyTorch ROCm builds.
+
+**Important:** The `uv run acestep` workflow currently installs CUDA PyTorch wheels and may overwrite an existing ROCm setup. `uv run acestep` is optimized for CUDA environments and may override ROCm PyTorch installations.
+
+#### Recommended workflow for AMD / ROCm users
+
+1. Create and activate a virtual environment manually:
+
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
+   ```
+
+2. Install a ROCm-compatible PyTorch build:
+
+   ```bash
+   pip install torch --index-url https://download.pytorch.org/whl/rocm6.0
+   ```
+
+3. Install ACE-Step dependencies without using uv run:
+
+   ```bash
+   pip install -e .
+   ```
+
+4. Start the service directly:
+
+   ```bash
+   python -m acestep.acestep_v15_pipeline --port 7680
+   ```
+
+This avoids CUDA wheel replacement and has been confirmed to work on ROCm systems. On Windows, use `.venv\Scripts\activate` and the same steps.
+
+#### Troubleshooting GPU Detection
+
+If you see "No GPU detected, running on CPU" with an AMD GPU:
+
+1. Run the GPU diagnostic tool:
+   ```bash
+   python scripts/check_gpu.py
+   ```
+
+2. For RDNA3 GPUs (RX 7000/9000 series), set `HSA_OVERRIDE_GFX_VERSION`:
+   - RX 7900 XT/XTX, RX 9070 XT: `export HSA_OVERRIDE_GFX_VERSION=11.0.0` (Linux) or `set HSA_OVERRIDE_GFX_VERSION=11.0.0` (Windows)
+   - RX 7800 XT, RX 7700 XT: `export HSA_OVERRIDE_GFX_VERSION=11.0.1`
+   - RX 7600: `export HSA_OVERRIDE_GFX_VERSION=11.0.2`
+
+3. On Windows, use `start_gradio_ui_rocm.bat` which automatically sets required environment variables.
+
+4. Verify ROCm installation: `rocm-smi` should list your GPU.
+
+### AMD / ROCM Linux Specific (cachy-os tested)
+Date of the program this worked:
+07.02.2026 - 10:40 am UTC +1
+
+ACE-Step1.5 Rocm Manual for cachy-os and tested with RDNA4.
+Look into docs\en\ACE-Step1.5-Rocm-Manual-Linux.md
+
+### Linux + Python 3.11 note
+
+Some Linux distributions (including Ubuntu) ship Python 3.11.0rc1, which is a **pre-release** build. This version is known to cause segmentation faults when using the vLLM backend due to C-extension incompatibilities.
+
+**Recommendation:** Use a stable Python release (≥ 3.11.12). On Ubuntu, this can be installed via the deadsnakes PPA.
+
+If upgrading Python is not possible, use the PyTorch backend:
+
+```bash
+uv run acestep --backend pt
+```
+
 ### 🪟 Windows Portable Package (Recommended for Windows)
 
 For Windows users, we provide a portable package with pre-installed dependencies:
@@ -107,7 +193,7 @@ Both scripts support:
 - ✅ Auto install `uv` if needed (via winget or PowerShell)
 - ✅ Configurable download source (HuggingFace/ModelScope)
 - ✅ Optional Git update check before startup
-- ✅ Customizable language, models, and parameters
+- ✅ Customizable , models, and parameters
 
 #### 📝 Configuration
 
@@ -115,7 +201,7 @@ Edit the scripts to customize settings:
 
 **start_gradio_ui.bat:**
 ```batch
-REM UI language (en, zh, ja)
+REM UI language (en, zh, he, ja)
 set LANGUAGE=zh
 
 REM Download source (auto, huggingface, modelscope)
@@ -127,6 +213,21 @@ set CHECK_UPDATE=true
 REM Model configuration
 set CONFIG_PATH=--config_path acestep-v15-turbo
 set LM_MODEL_PATH=--lm_model_path acestep-5Hz-lm-1.7B
+
+REM LLM initialization (auto/true/false)
+REM Auto: enabled if VRAM > 6GB, disabled otherwise
+REM set INIT_LLM=--init_llm true   # Force enable (may cause OOM on low VRAM)
+REM set INIT_LLM=--init_llm false  # Force disable (DiT-only mode)
+```
+
+**start_api_server.bat:**
+```batch
+REM LLM initialization via environment variable
+REM set ACESTEP_INIT_LLM=true   # Force enable LLM
+REM set ACESTEP_INIT_LLM=false  # Force disable LLM (DiT-only mode)
+
+REM LM model path (optional)
+REM set LM_MODEL_PATH=--lm-model-path acestep-5Hz-lm-0.6B
 ```
 
 #### 🔄 Update & Maintenance Tools
@@ -210,6 +311,8 @@ If you have `PortableGit/` folder in your package, you can:
 
 ### Standard Installation (All Platforms)
 
+> **AMD / ROCm users:** `uv run acestep` is optimized for CUDA and may override ROCm PyTorch. Use the [AMD / ROCm workflow](#amd--rocm-gpus) above instead.
+
 ### 1. Install uv (Package Manager)
 
 ```bash
@@ -285,8 +388,9 @@ API runs at http://localhost:8001. See [API Documentation](./docs/en/API.md) for
 | `--port` | 7860 | Server port |
 | `--server-name` | 127.0.0.1 | Server address (use `0.0.0.0` for network access) |
 | `--share` | false | Create public Gradio link |
-| `--language` | en | UI language: `en`, `zh`, `ja` |
+| `--language` | en | UI language: `en`, `zh`, `he`, `ja` |
 | `--init_service` | false | Auto-initialize models on startup |
+| `--init_llm` | auto | LLM initialization: `true` (force), `false` (disable), omit for auto |
 | `--config_path` | auto | DiT model (e.g., `acestep-v15-turbo`, `acestep-v15-turbo-shift3`) |
 | `--lm_model_path` | auto | LM model (e.g., `acestep-5Hz-lm-0.6B`, `acestep-5Hz-lm-1.7B`) |
 | `--offload_to_cpu` | auto | CPU offload (auto-enabled if VRAM < 16GB) |
@@ -336,6 +440,53 @@ uv run acestep --download-source huggingface
 python acestep/acestep_v15_pipeline.py --download-source huggingface
 ```
 
+### Environment Variables (.env)
+
+For `uv` or Python users, you can configure ACE-Step using environment variables in a `.env` file:
+
+```bash
+# Copy the example file
+cp .env.example .env
+
+# Edit .env with your settings
+```
+
+**Key environment variables:**
+
+| Variable | Values | Description |
+|----------|--------|-------------|
+| `ACESTEP_INIT_LLM` | (empty), `true`, `false` | LLM initialization mode |
+| `ACESTEP_CONFIG_PATH` | model name | DiT model path |
+| `ACESTEP_LM_MODEL_PATH` | model name | LM model path |
+| `ACESTEP_DOWNLOAD_SOURCE` | `auto`, `huggingface`, `modelscope` | Download source |
+| `ACESTEP_API_KEY` | string | API authentication key |
+
+**LLM Initialization (`ACESTEP_INIT_LLM`):**
+
+Processing flow: `GPU Detection (full) → ACESTEP_INIT_LLM Override → Model Loading`
+
+GPU optimizations (offload, quantization, batch limits) are **always applied**. The override only controls whether to attempt LLM loading.
+
+| Value | Behavior |
+|-------|----------|
+| `auto` (or empty) | Use GPU auto-detection result (recommended) |
+| `true` / `1` / `yes` | Force enable LLM after GPU detection (may cause OOM) |
+| `false` / `0` / `no` | Force disable for pure DiT mode, faster generation |
+
+**Example `.env` for different scenarios:**
+
+```bash
+# Auto mode (recommended) - let GPU detection decide
+ACESTEP_INIT_LLM=auto
+
+# Force enable on low VRAM GPU (GPU optimizations still applied)
+ACESTEP_INIT_LLM=true
+ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-0.6B
+
+# Force disable LLM for faster generation
+ACESTEP_INIT_LLM=false
+```
+
 ### Development
 
 ```bash
@@ -364,67 +515,6 @@ Currently, we support Intel GPUs.
 ## 📥 Model Download
 
 Models are automatically downloaded from [HuggingFace](https://huggingface.co/ACE-Step/Ace-Step1.5) or [ModelScope](https://modelscope.cn/organization/ACE-Step) on first run. You can also manually download models using the CLI or `huggingface-cli`.
-
-### Download Source Configuration
-
-ACE-Step supports multiple download sources with automatic fallback:
-
-| Source | Description | Configuration |
-|--------|-------------|---------------|
-| **auto** (default) | Automatic detection based on network, selects best source | `--download-source auto` or omit |
-| **modelscope** | Use ModelScope as download source | `--download-source modelscope` |
-| **huggingface** | Use HuggingFace Hub as download source | `--download-source huggingface` |
-
-**How it works:**
-- **Auto mode** (default): Tests Google connectivity. If accessible → HuggingFace Hub; if not → ModelScope
-- **Manual mode**: Uses your specified source, with automatic fallback to alternate source on failure
-- **Fallback protection**: If primary source fails, automatically tries the other source
-
-**Examples:**
-
-> **Note for Python users:** Replace `python` with your environment's Python executable (see note in Launch section above).
-
-```bash
-# Use ModelScope
-uv run acestep --download-source modelscope
-# Or using Python directly:
-python acestep/acestep_v15_pipeline.py --download-source modelscope
-
-# Use HuggingFace Hub
-uv run acestep --download-source huggingface
-# Or using Python directly:
-python acestep/acestep_v15_pipeline.py --download-source huggingface
-
-# Auto-detect (default, no configuration needed)
-uv run acestep
-# Or using Python directly:
-python acestep/acestep_v15_pipeline.py
-```
-
-**For Windows portable package users**, edit `start_gradio_ui.bat` or `start_api_server.bat`:
-
-```batch
-REM Use ModelScope
-set DOWNLOAD_SOURCE=--download-source modelscope
-
-REM Use HuggingFace Hub
-set DOWNLOAD_SOURCE=--download-source huggingface
-
-REM Auto-detect (default)
-set DOWNLOAD_SOURCE=
-```
-
-**For command line users:**
-
-> **Note for Python users:** Replace `python` with your environment's Python executable (see note in Launch section above).
-
-```bash
-# Using uv
-uv run acestep --download-source modelscope
-
-# Using Python directly
-python acestep/acestep_v15_pipeline.py --download-source modelscope
-```
 
 ### Automatic Download
 
@@ -538,10 +628,16 @@ We provide multiple ways to use ACE-Step:
 | Method | Description | Documentation |
 |--------|-------------|---------------|
 | 🖥️ **Gradio Web UI** | Interactive web interface for music generation | [Gradio Guide](./docs/en/GRADIO_GUIDE.md) |
+| 🎚️ **Studio UI (Experimental)** | Optional HTML frontend for REST API (DAW-like) | [Studio UI](./docs/en/studio.md) |
 | 🐍 **Python API** | Programmatic access for integration | [Inference API](./docs/en/INFERENCE.md) |
 | 🌐 **REST API** | HTTP-based async API for services | [REST API](./docs/en/API.md) |
+| ⌨️ **CLI** | Interactive wizard and configuration for commandline interface | [CLI Guide](./docs/en/CLI.md) |
 
 **📚 Documentation available in:** [English](./docs/en/) | [中文](./docs/zh/) | [日本語](./docs/ja/)
+
+### Experimental Studio UI
+
+An optional, frontend-only HTML Studio UI is available for users who prefer a more structured interface. It uses the same REST API and does not change backend behavior. Start the API server, then open `ui/studio.html` in a browser and point it at your API URL. See [Studio UI](./docs/en/studio.md).
 
 ## 📖 Tutorial
 
