@@ -62,11 +62,86 @@ REM Authentication
 REM set AUTH_USERNAME=--auth-username admin
 REM set AUTH_PASSWORD=--auth-password password
 
+REM Update check on startup (set to false to disable)
+set CHECK_UPDATE=true
+REM set CHECK_UPDATE=false
+
 REM ==================== Venv Configuration ====================
 REM Path to the ROCm virtual environment (relative to this script)
 set VENV_DIR=%~dp0venv_rocm
 
 REM ==================== Launch ====================
+
+REM ==================== Startup Update Check ====================
+if /i not "%CHECK_UPDATE%"=="true" goto :SkipUpdateCheck
+
+REM Find git: try PortableGit first, then system git
+set "UPDATE_GIT_CMD="
+if exist "%~dp0PortableGit\bin\git.exe" (
+    set "UPDATE_GIT_CMD=%~dp0PortableGit\bin\git.exe"
+) else (
+    where git >nul 2>&1
+    if !ERRORLEVEL! EQU 0 (
+        for /f "tokens=*" %%i in ('where git 2^>nul') do (
+            if not defined UPDATE_GIT_CMD set "UPDATE_GIT_CMD=%%i"
+        )
+    )
+)
+if not defined UPDATE_GIT_CMD goto :SkipUpdateCheck
+
+cd /d "%~dp0"
+"!UPDATE_GIT_CMD!" rev-parse --git-dir >nul 2>&1
+if !ERRORLEVEL! NEQ 0 goto :SkipUpdateCheck
+
+echo [Update] Checking for updates...
+
+for /f "tokens=*" %%i in ('"!UPDATE_GIT_CMD!" rev-parse --abbrev-ref HEAD 2^>nul') do set UPDATE_BRANCH=%%i
+if "!UPDATE_BRANCH!"=="" set UPDATE_BRANCH=main
+for /f "tokens=*" %%i in ('"!UPDATE_GIT_CMD!" rev-parse --short HEAD 2^>nul') do set UPDATE_LOCAL=%%i
+
+"!UPDATE_GIT_CMD!" fetch origin --quiet 2>nul
+if !ERRORLEVEL! NEQ 0 (
+    echo [Update] Network unreachable, skipping.
+    echo.
+    goto :SkipUpdateCheck
+)
+
+for /f "tokens=*" %%i in ('"!UPDATE_GIT_CMD!" rev-parse --short origin/!UPDATE_BRANCH! 2^>nul') do set UPDATE_REMOTE=%%i
+
+if "!UPDATE_REMOTE!"=="" goto :SkipUpdateCheck
+if "!UPDATE_LOCAL!"=="!UPDATE_REMOTE!" (
+    echo [Update] Already up to date ^(!UPDATE_LOCAL!^).
+    echo.
+    goto :SkipUpdateCheck
+)
+
+echo.
+echo ========================================
+echo   Update available!
+echo ========================================
+echo   Current: !UPDATE_LOCAL!  -^>  Latest: !UPDATE_REMOTE!
+echo.
+echo   Recent changes:
+"!UPDATE_GIT_CMD!" --no-pager log --oneline HEAD..origin/!UPDATE_BRANCH! 2>nul
+echo.
+
+set /p UPDATE_NOW="Update now before starting? (Y/N): "
+if /i "!UPDATE_NOW!"=="Y" (
+    if exist "%~dp0check_update.bat" (
+        call "%~dp0check_update.bat"
+    ) else (
+        echo Pulling latest changes...
+        "!UPDATE_GIT_CMD!" pull --ff-only origin !UPDATE_BRANCH! 2>nul
+        if !ERRORLEVEL! NEQ 0 (
+            echo [Update] Update failed. Please update manually.
+        )
+    )
+) else (
+    echo [Update] Skipped. Run check_update.bat to update later.
+)
+echo.
+
+:SkipUpdateCheck
 
 echo ============================================
 echo   ACE-Step 1.5 - AMD ROCm 7.2 Edition

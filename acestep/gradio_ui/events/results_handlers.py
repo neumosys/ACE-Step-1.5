@@ -5,7 +5,11 @@ Contains event handlers and helper functions related to result display, scoring,
 import os
 import json
 import datetime
+import math
 import re
+import tempfile
+import shutil
+import zipfile
 import time as time_module
 import sys
 from typing import Dict, Any, Optional, List
@@ -21,7 +25,7 @@ from acestep.gpu_config import (
     check_batch_size_limit,
 )
 
-# Platform detection for Windows-specific fixess
+# Platform detection for Windows-specific fixes
 IS_WINDOWS = sys.platform == "win32"
 
 # Global results directory inside project root
@@ -272,122 +276,59 @@ def _build_generation_info(
     seed_value: str,
     inference_steps: int,
     num_audios: int,
+    audio_format: str = "flac",
 ) -> str:
-    """Build generation info string from result data.
+    """Build a compact generation timing summary.
     
     Args:
-        lm_metadata: LM-generated metadata dictionary
+        lm_metadata: LM-generated metadata dictionary (unused, kept for API compat)
         time_costs: Unified time costs dictionary
-        seed_value: Seed value string
-        inference_steps: Number of inference steps
+        seed_value: Seed value string (unused, kept for API compat)
+        inference_steps: Number of inference steps (unused, kept for API compat)
         num_audios: Number of generated audios
+        audio_format: Output audio format name (e.g. "flac", "mp3", "wav32")
         
     Returns:
         Formatted generation info string
     """
+    if not time_costs or num_audios <= 0:
+        return ""
+
+    songs_label = f"({num_audios} song{'s' if num_audios > 1 else ''})"
     info_parts = []
-    
-    # Part 1: Per-track average time (prominently displayed at the top)
-    # Only count model time (LM + DiT), not post-processing like audio conversion
-    if time_costs and num_audios > 0:
-        lm_total = time_costs.get('lm_total_time', 0.0)
-        dit_total = time_costs.get('dit_total_time_cost', 0.0)
-        model_total = lm_total + dit_total
-        if model_total > 0:
-            avg_time_per_track = model_total / num_audios
-            avg_section = f"**🎯 Average Time per Track: {avg_time_per_track:.2f}s** ({num_audios} track(s))"
-            info_parts.append(avg_section)
-    
-    # Part 2: LM-generated metadata (if available)
-    if lm_metadata:
-        metadata_lines = []
-        if lm_metadata.get('bpm'):
-            metadata_lines.append(f"- **BPM:** {lm_metadata['bpm']}")
-        if lm_metadata.get('caption'):
-            metadata_lines.append(f"- **Refined Caption:** {lm_metadata['caption']}")
-        if lm_metadata.get('lyrics'):
-            metadata_lines.append(f"- **Refined Lyrics:** {lm_metadata['lyrics']}")
-        if lm_metadata.get('duration'):
-            metadata_lines.append(f"- **Duration:** {lm_metadata['duration']} seconds")
-        if lm_metadata.get('keyscale'):
-            metadata_lines.append(f"- **Key Scale:** {lm_metadata['keyscale']}")
-        if lm_metadata.get('language'):
-            metadata_lines.append(f"- **Language:** {lm_metadata['language']}")
-        if lm_metadata.get('timesignature'):
-            metadata_lines.append(f"- **Time Signature:** {lm_metadata['timesignature']}")
-        
-        if metadata_lines:
-            metadata_section = "**🤖 LM-Generated Metadata:**\n" + "\n".join(metadata_lines)
-            info_parts.append(metadata_section)
-    
-    # Part 3: Time costs breakdown (formatted and beautified)
-    if time_costs:
-        time_lines = []
-        
-        # LM time costs
-        lm_phase1 = time_costs.get('lm_phase1_time', 0.0)
-        lm_phase2 = time_costs.get('lm_phase2_time', 0.0)
-        lm_total = time_costs.get('lm_total_time', 0.0)
-        
+
+    # --- Block 1: Generation time (LM + DiT) ---
+    lm_total = time_costs.get('lm_total_time', 0.0)
+    dit_total = time_costs.get('dit_total_time_cost', 0.0)
+    gen_total = lm_total + dit_total
+
+    if gen_total > 0:
+        avg = gen_total / num_audios
+        lines = [f"**🎵 Total generation time {songs_label}: {gen_total:.2f}s**"]
+        lines.append(f"- {avg:.2f}s per song")
         if lm_total > 0:
-            time_lines.append("**🧠 LM Time:**")
-            if lm_phase1 > 0:
-                time_lines.append(f"  - Phase 1 (CoT): {lm_phase1:.2f}s")
-            if lm_phase2 > 0:
-                time_lines.append(f"  - Phase 2 (Codes): {lm_phase2:.2f}s")
-            time_lines.append(f"  - Total: {lm_total:.2f}s")
-        
-        # DiT time costs
-        dit_encoder = time_costs.get('dit_encoder_time_cost', 0.0)
-        dit_model = time_costs.get('dit_model_time_cost', 0.0)
-        dit_vae_decode = time_costs.get('dit_vae_decode_time_cost', 0.0)
-        dit_offload = time_costs.get('dit_offload_time_cost', 0.0)
-        dit_total = time_costs.get('dit_total_time_cost', 0.0)
+            lines.append(f"- LM phase {songs_label}: {lm_total:.2f}s")
         if dit_total > 0:
-            time_lines.append("\n**🎵 DiT Time:**")
-            if dit_encoder > 0:
-                time_lines.append(f"  - Encoder: {dit_encoder:.2f}s")
-            if dit_model > 0:
-                time_lines.append(f"  - Model: {dit_model:.2f}s")
-            if dit_vae_decode > 0:
-                time_lines.append(f"  - VAE Decode: {dit_vae_decode:.2f}s")
-            if dit_offload > 0:
-                time_lines.append(f"  - Offload: {dit_offload:.2f}s")
-            time_lines.append(f"  - Total: {dit_total:.2f}s")
-        
-        # Post-processing time costs
-        audio_conversion_time = time_costs.get('audio_conversion_time', 0.0)
-        auto_score_time = time_costs.get('auto_score_time', 0.0)
-        auto_lrc_time = time_costs.get('auto_lrc_time', 0.0)
-        
-        if audio_conversion_time > 0 or auto_score_time > 0 or auto_lrc_time > 0:
-            time_lines.append("\n**🔧 Post-processing Time:**")
-            if audio_conversion_time > 0:
-                time_lines.append(f"  - Audio Conversion: {audio_conversion_time:.2f}s")
-            if auto_score_time > 0:
-                time_lines.append(f"  - Auto Score: {auto_score_time:.2f}s")
-            if auto_lrc_time > 0:
-                time_lines.append(f"  - Auto LRC: {auto_lrc_time:.2f}s")
-        
-        if time_lines:
-            time_section = "\n".join(time_lines)
-            info_parts.append(time_section)
-    
-    # Part 4: Generation summary
-    summary_lines = [
-        "**🎵 Generation Complete**",
-        f"  - **Seeds:** {seed_value}",
-        f"  - **Steps:** {inference_steps}",
-        f"  - **Audio Count:** {num_audios} audio(s)",
-    ]
-    info_parts.append("\n".join(summary_lines))
-    
-    # Part 5: Pipeline total time (at the end)
-    pipeline_total = time_costs.get('pipeline_total_time', 0.0) if time_costs else 0.0
-    if pipeline_total > 0:
-        info_parts.append(f"**⏱️ Total Time: {pipeline_total:.2f}s**")
-    
-    # Combine all parts
+            lines.append(f"- DiT phase {songs_label}: {dit_total:.2f}s")
+        info_parts.append("\n".join(lines))
+
+    # --- Block 2: Processing time (conversion + scoring + LRC) ---
+    audio_conversion_time = time_costs.get('audio_conversion_time', 0.0)
+    auto_score_time = time_costs.get('auto_score_time', 0.0)
+    auto_lrc_time = time_costs.get('auto_lrc_time', 0.0)
+    proc_total = audio_conversion_time + auto_score_time + auto_lrc_time
+
+    if proc_total > 0:
+        fmt_label = audio_format.upper() if audio_format != "wav32" else "WAV 32-bit"
+        lines = [f"**🔧 Total processing time {songs_label}: {proc_total:.2f}s**"]
+        if audio_conversion_time > 0:
+            lines.append(f"- to {fmt_label} {songs_label}: {audio_conversion_time:.2f}s")
+        if auto_score_time > 0:
+            lines.append(f"- scoring {songs_label}: {auto_score_time:.2f}s")
+        if auto_lrc_time > 0:
+            lines.append(f"- LRC detection {songs_label}: {auto_lrc_time:.2f}s")
+        info_parts.append("\n".join(lines))
+
     return "\n\n".join(info_parts)
 
 
@@ -456,12 +397,12 @@ def send_audio_to_src_with_metadata(audio_file, lm_metadata):
         lm_metadata: Dictionary containing LM-generated metadata (unused, kept for API compatibility)
         
     Returns:
-        Tuple of (audio_file, bpm, caption, lyrics, duration, key_scale, language, time_signature, is_format_caption)
-        All values except audio_file are gr.skip() to preserve existing UI values
+        Tuple of (audio_file, bpm, caption, lyrics, duration, key_scale, language, time_signature, is_format_caption, audio_uploads_accordion)
+        All values except audio_file and accordion are gr.skip() to preserve existing UI values
     """
     if audio_file is None:
         # Return all skip to not modify anything
-        return (gr.skip(),) * 9
+        return (gr.skip(),) * 10
     
     # Only set the audio file, skip all other fields to preserve existing values
     # This ensures user's caption, lyrics, bpm, etc. are NOT cleared
@@ -475,6 +416,64 @@ def send_audio_to_src_with_metadata(audio_file, lm_metadata):
         gr.skip(),       # language - preserve existing value
         gr.skip(),       # time_signature - preserve existing value
         gr.skip(),       # is_format_caption - preserve existing value
+        gr.Accordion(open=True),  # audio_uploads_accordion - open to show the src audio
+    )
+
+
+def _extract_metadata_for_editing(lm_metadata):
+    """Extract lyrics and caption from lm_metadata for repaint/remix operations.
+    
+    Args:
+        lm_metadata: Metadata dictionary from LM generation (or None)
+    
+    Returns:
+        Tuple of (lyrics, caption) as strings (empty strings if not found)
+    """
+    lyrics = ""
+    caption = ""
+    if lm_metadata and isinstance(lm_metadata, dict):
+        lyrics = lm_metadata.get("lyrics", "")
+        caption = lm_metadata.get("caption", "")
+    return lyrics, caption
+
+
+def send_audio_to_remix(audio_file, lm_metadata):
+    """Send generated audio to src_audio and switch mode to Remix.
+    Also populate lyrics and caption fields from the generated audio.
+    
+    Returns:
+        Tuple of (src_audio, generation_mode, lyrics, caption)
+    """
+    if audio_file is None:
+        return (gr.skip(),) * 4
+    
+    lyrics, caption = _extract_metadata_for_editing(lm_metadata)
+    
+    return (
+        audio_file,                       # src_audio
+        gr.update(value="Remix"),         # generation_mode -> Remix
+        lyrics,                           # lyrics
+        caption,                          # caption
+    )
+
+
+def send_audio_to_repaint(audio_file, lm_metadata):
+    """Send generated audio to src_audio and switch mode to Repaint.
+    Also populate lyrics field with lyrics from the generated audio.
+    
+    Returns:
+        Tuple of (src_audio, generation_mode, lyrics, caption)
+    """
+    if audio_file is None:
+        return (gr.skip(),) * 4
+    
+    lyrics, caption = _extract_metadata_for_editing(lm_metadata)
+    
+    return (
+        audio_file,                       # src_audio
+        gr.update(value="Repaint"),       # generation_mode -> Repaint
+        lyrics,                           # lyrics
+        caption,                          # caption
     )
 
 
@@ -493,9 +492,15 @@ def generate_with_progress(
     auto_score,
     auto_lrc,
     score_scale,
+
     lm_batch_chunk_size,
+    enable_normalization,
+    normalization_db,
+    latent_shift,
+    latent_rescale,
     progress=gr.Progress(track_tqdm=True),
 ):
+
     """Generate audio with progress tracking"""
     
     # ========== GPU Memory Validation ==========
@@ -576,7 +581,12 @@ def generate_with_progress(
         use_cot_caption=use_cot_caption,
         use_cot_language=use_cot_language,
         use_constrained_decoding=True,
+        enable_normalization=enable_normalization,
+        normalization_db=normalization_db,
+        latent_shift=latent_shift,
+        latent_rescale=latent_rescale,
     )
+
     # seed string to list
     if isinstance(seed, str) and seed.strip():
         if "," in seed:
@@ -631,6 +641,7 @@ def generate_with_progress(
         seed_value=seed_value_for_ui,
         inference_steps=inference_steps,
         num_audios=len(result.audios) if result.success else 0,
+        audio_format=audio_format,
     )
     
     if not result.success:
@@ -663,7 +674,7 @@ def generate_with_progress(
     # Clear lrc_display with empty string - this triggers .change() to clear subtitles
     clear_lrcs = [gr.update(value="", visible=True) for _ in range(8)]
     clear_accordions = [gr.skip() for _ in range(8)]  # Don't change accordion visibility
-    dump_audio = [gr.update(value=None, subtitles=None) for _ in range(8)]
+    dump_audio = [gr.update(value=None, subtitles=None, playback_position=0) for _ in range(8)]
     yield (
         # Audio outputs - just skip, value will be updated in loop
         # Subtitles will be cleared via lrc_display.change()
@@ -691,29 +702,33 @@ def generate_with_progress(
     )
     time_module.sleep(0.1)
     
-    final_codes_display_updates = [gr.skip() for _ in range(8)]
     for i in range(8):
         if i < len(audios):
             key = audios[i]["key"]
             audio_tensor = audios[i]["tensor"]
             sample_rate = audios[i]["sample_rate"]
             audio_params = audios[i]["params"]
-            is_silent = audios[i].get("silent", False)
+            # Use local output directory instead of system temp
             timestamp = int(time_module.time())
             temp_dir = os.path.join(DEFAULT_RESULTS_DIR, f"batch_{timestamp}")
             temp_dir = os.path.abspath(temp_dir).replace("\\", "/")
             os.makedirs(temp_dir, exist_ok=True)
             json_path = os.path.join(temp_dir, f"{key}.json").replace("\\", "/")
-            audio_path = os.path.join(temp_dir, f"{key}.{audio_format}").replace("\\", "/")
-            if not is_silent and audio_tensor is not None:
-                save_audio(audio_data=audio_tensor, output_path=audio_path, sample_rate=sample_rate, format=audio_format, channels_first=True)
-                with open(json_path, 'w', encoding='utf-8') as f:
-                    json.dump(audio_params, f, indent=2, ensure_ascii=False)
-                audio_outputs[i] = audio_path
-                all_audio_paths.append(audio_path)
-                all_audio_paths.append(json_path)
-            else:
-                audio_outputs[i] = None
+            
+            # Handle wav32 extension
+            ext = "wav" if audio_format == "wav32" else audio_format
+            audio_path = os.path.join(temp_dir, f"{key}.{ext}").replace("\\", "/")
+            
+            # Save audio and capture actual saved path
+            saved_path = save_audio(audio_data=audio_tensor, output_path=audio_path, sample_rate=sample_rate, format=audio_format, channels_first=True)
+            if saved_path:
+                audio_path = saved_path.replace("\\", "/")
+
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(audio_params, f, indent=2, ensure_ascii=False)
+            audio_outputs[i] = audio_path
+            all_audio_paths.append(audio_path)
+            all_audio_paths.append(json_path)
             
             code_str = audio_params.get("audio_codes", "")
             final_codes_list[i] = code_str
@@ -826,7 +841,6 @@ def generate_with_progress(
             
             codes_display_updates = [gr.skip() for _ in range(8)]
             codes_display_updates[i] = gr.update(value=code_str, visible=True)  # Keep visible=True
-            final_codes_display_updates[i] = gr.update(value=code_str, visible=True)  # Keep visible=True
             
             details_accordion_updates = [gr.skip() for _ in range(8)]
             # Don't change accordion visibility - keep it always expandable
@@ -921,9 +935,11 @@ def generate_with_progress(
         seed_value=seed_value_for_ui,
         inference_steps=inference_steps,
         num_audios=len(result.audios),
+        audio_format=audio_format,
     )
     
     # Build final codes display, LRC display, accordion visibility updates
+    final_codes_display_updates = [gr.skip() for _ in range(8)]
     # final_lrc_display_updates = [gr.skip() for _ in range(8)]
     final_accordion_updates = [gr.skip() for _ in range(8)]
 
@@ -934,8 +950,7 @@ def generate_with_progress(
     for idx in range(8):
         path = audio_outputs[idx]
         if path:
-            # Pass path directly; Gradio Audio component with type="filepath" expects a string path
-            audio_playback_updates.append(gr.update(value=path, label=f"Sample {idx+1} (Ready)", interactive=True))
+            audio_playback_updates.append(gr.update(value=path, label=f"Sample {idx+1} (Ready)", interactive=False))
             logger.info(f"[generate_with_progress] Audio {idx+1} path: {path}")
         else:
             audio_playback_updates.append(gr.update(value=None, label="None", interactive=False))
@@ -1295,7 +1310,8 @@ def generate_lrc_handler(dit_handler, sample_idx, current_batch_index, batch_que
         Tuple of (lrc_display_update, details_accordion_update, batch_queue)
         Note: No audio_update - subtitles updated via lrc_display.change()
     """
-
+    import torch
+    
     if current_batch_index not in batch_queue:
         return gr.skip(), gr.skip(), batch_queue
 
@@ -1428,8 +1444,12 @@ def capture_current_params(
     think_checkbox, lm_cfg_scale, lm_top_k, lm_top_p, lm_negative_prompt,
     use_cot_metas, use_cot_caption, use_cot_language,
     constrained_decoding_debug, allow_lm_batch, auto_score, auto_lrc, score_scale, lm_batch_chunk_size,
-    track_name, complete_track_classes
+
+    track_name, complete_track_classes,
+    enable_normalization, normalization_db,
+    latent_shift, latent_rescale
 ):
+
     """Capture current UI parameters for next batch generation
     
     IMPORTANT: For AutoGen batches, we clear audio codes to ensure:
@@ -1481,7 +1501,13 @@ def capture_current_params(
         "lm_batch_chunk_size": lm_batch_chunk_size,
         "track_name": track_name,
         "complete_track_classes": complete_track_classes,
+
+        "enable_normalization": enable_normalization,
+        "normalization_db": normalization_db,
+        "latent_shift": latent_shift,
+        "latent_rescale": latent_rescale,
     }
+
 
 
 def generate_with_batch_management(
@@ -1502,7 +1528,13 @@ def generate_with_batch_management(
     lm_batch_chunk_size,
     track_name,
     complete_track_classes,
+
+    enable_normalization,
+    normalization_db,
+    latent_shift,
+    latent_rescale,
     autogen_checkbox,
+
     current_batch_index,
     total_batches,
     batch_queue,
@@ -1529,15 +1561,28 @@ def generate_with_batch_management(
         auto_lrc,
         score_scale,
         lm_batch_chunk_size,
+
+        enable_normalization,
+        normalization_db,
+        latent_shift,
+        latent_rescale,
         progress
     )
+
     final_result_from_inner = None
     for partial_result in generator:
         final_result_from_inner = partial_result
-        # Progressive yields disabled on all platforms to prevent audio preview
-        # from reverting to the first generated song due to Gradio event queue
-        # race condition (generator yields vs .change() event handlers).
-        # Only the final yield (with batch management state) is sent to the UI.
+        # Progressive yields disabled on Windows to prevent UI freeze
+        # On other platforms, yield progress updates normally
+        if not IS_WINDOWS:
+            # current_batch_index, total_batches, batch_queue, next_params,
+            # batch_indicator_text, prev_btn, next_btn, next_status, restore_btn
+            # Slice off extra_outputs and raw_codes_list (last 2 items) before re-yielding to UI
+            ui_result = partial_result[:-2] if len(partial_result) > 47 else (partial_result[:-1] if len(partial_result) > 46 else partial_result)
+            yield ui_result + (
+                gr.skip(), gr.skip(), gr.skip(), gr.skip(),
+                gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
+            )
     result = final_result_from_inner
     all_audio_paths = result[8]
 
@@ -1615,7 +1660,13 @@ def generate_with_batch_management(
         "lm_batch_chunk_size": lm_batch_chunk_size,
         "track_name": track_name,
         "complete_track_classes": complete_track_classes,
+
+        "enable_normalization": enable_normalization,
+        "normalization_db": normalization_db,
+        "latent_shift": latent_shift,
+        "latent_rescale": latent_rescale,
     }
+
     
     # Next batch parameters (with cleared codes & random seed)
     # Next batch parameters
@@ -1778,7 +1829,7 @@ def generate_next_batch_background(
         params.setdefault("shift", 1.0)
         params.setdefault("infer_method", "ode")
         params.setdefault("custom_timesteps", "")
-        params.setdefault("audio_format", "mp3")
+        params.setdefault("audio_format", "flac")
         params.setdefault("lm_temperature", 0.85)
         params.setdefault("think_checkbox", True)
         params.setdefault("lm_cfg_scale", 2.0)
@@ -1796,6 +1847,10 @@ def generate_next_batch_background(
         params.setdefault("lm_batch_chunk_size", 8)
         params.setdefault("track_name", None)
         params.setdefault("complete_track_classes", [])
+        params.setdefault("enable_normalization", True)
+        params.setdefault("normalization_db", -1.0)
+        params.setdefault("latent_shift", 0.0)
+        params.setdefault("latent_rescale", 1.0)
         
         # Call generate_with_progress with the saved parameters
         # Note: generate_with_progress is a generator, need to iterate through it
@@ -1847,6 +1902,10 @@ def generate_next_batch_background(
             auto_lrc=params.get("auto_lrc"),
             score_scale=params.get("score_scale"),
             lm_batch_chunk_size=params.get("lm_batch_chunk_size"),
+            enable_normalization=params.get("enable_normalization"),
+            normalization_db=params.get("normalization_db"),
+            latent_shift=params.get("latent_shift", 0.0),
+            latent_rescale=params.get("latent_rescale", 1.0),
             progress=progress
         )
         
@@ -2005,7 +2064,6 @@ def navigate_to_previous_batch(current_batch_index, batch_queue):
     for idx in range(8):
         if idx < len(real_audio_paths):
             audio_path = real_audio_paths[idx].replace("\\", "/")  # Normalize path
-            # Pass path directly; Gradio Audio component with type="filepath" expects a string path
             audio_updates.append(gr.update(value=audio_path))
         else:
             audio_updates.append(gr.update(value=None))
@@ -2129,7 +2187,6 @@ def navigate_to_next_batch(autogen_enabled, current_batch_index, total_batches, 
     for idx in range(8):
         if idx < len(real_audio_paths):
             audio_path = real_audio_paths[idx].replace("\\", "/")  # Normalize path
-            # Pass path directly; Gradio Audio component with type="filepath" expects a string path
             audio_updates.append(gr.update(value=audio_path))
         else:
             audio_updates.append(gr.update(value=None))
@@ -2257,6 +2314,15 @@ def restore_batch_parameters(current_batch_index, batch_queue):
     track_name = params.get("track_name", None)
     complete_track_classes = params.get("complete_track_classes", [])
     
+    # Audio Normalization
+    enable_normalization = params.get("enable_normalization", True)
+    normalization_db = params.get("normalization_db", -1.0)
+
+    # Latent Shift / Rescale
+    latent_shift = params.get("latent_shift", 0.0)
+    latent_rescale = params.get("latent_rescale", 1.0)
+
+    
     # Extract codes - only restore to single input
     stored_codes = batch_data.get("codes", "")
     if stored_codes:
@@ -2276,5 +2342,65 @@ def restore_batch_parameters(current_batch_index, batch_queue):
         vocal_language, audio_duration, batch_size_input, inference_steps,
         lm_temperature, lm_cfg_scale, lm_top_k, lm_top_p, think_checkbox,
         use_cot_caption, use_cot_language, allow_lm_batch,
-        track_name, complete_track_classes
+        track_name, complete_track_classes,
+        enable_normalization, normalization_db,
+        latent_shift, latent_rescale
     )
+
+
+def convert_result_audio_to_codes(dit_handler, generated_audio):
+    """Convert a generated audio sample to LM audio codes.
+    
+    Args:
+        dit_handler: DiT handler instance with convert_src_audio_to_codes method
+        generated_audio: File path to the generated audio
+        
+    Returns:
+        Tuple of (codes_display_update, details_accordion_update)
+    """
+    if not generated_audio:
+        gr.Warning("No audio to convert.")
+        return gr.skip(), gr.skip()
+    
+    if not dit_handler or dit_handler.model is None:
+        gr.Warning(t("messages.service_not_initialized"))
+        return gr.skip(), gr.skip()
+    
+    try:
+        codes_string = dit_handler.convert_src_audio_to_codes(generated_audio)
+        if not codes_string or codes_string.startswith("❌"):
+            gr.Warning(f"Failed to convert audio to codes: {codes_string}")
+            return gr.skip(), gr.skip()
+        
+        gr.Info("Audio converted to codes successfully.")
+        return gr.update(value=codes_string), gr.update(open=True)
+    except Exception as e:
+        gr.Warning(f"Error converting audio to codes: {e}")
+        return gr.skip(), gr.skip()
+
+
+def save_lrc_to_file(lrc_text):
+    """Save LRC text to a downloadable .lrc file.
+    
+    Args:
+        lrc_text: The LRC text content to save
+        
+    Returns:
+        gr.update for the File component with the .lrc file path
+    """
+    if not lrc_text or not lrc_text.strip():
+        gr.Warning("No LRC content to save.")
+        return gr.skip()
+    
+    try:
+        # Create a temporary file with .lrc extension
+        tmp_dir = tempfile.mkdtemp()
+        lrc_path = os.path.join(tmp_dir, "lyrics.lrc")
+        with open(lrc_path, "w", encoding="utf-8") as f:
+            f.write(lrc_text)
+        gr.Info("LRC file ready for download.")
+        return gr.update(value=lrc_path, visible=True)
+    except Exception as e:
+        gr.Warning(f"Error saving LRC file: {e}")
+        return gr.skip()
+

@@ -41,6 +41,7 @@ except ImportError:  # Optional dependency
     load_dotenv = None  # type: ignore
 
 from fastapi import FastAPI, HTTPException, Request, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
@@ -68,6 +69,7 @@ from acestep.gpu_config import (
     is_lm_model_supported,
     GPUConfig,
     VRAM_16GB_MIN_GB,
+    VRAM_AUTO_OFFLOAD_THRESHOLD_GB,
 )
 
 
@@ -373,6 +375,8 @@ PARAM_ALIASES = {
     "use_cot_language": ["use_cot_language", "cot_language", "cot-language"],
     "is_format_caption": ["is_format_caption", "isFormatCaption"],
     "allow_lm_batch": ["allow_lm_batch", "allowLmBatch", "parallel_thinking"],
+    "track_name": ["track_name", "trackName"],
+    "track_classes": ["track_classes", "trackClasses", "instruments"],
 }
 
 
@@ -518,6 +522,8 @@ class GenerateMusicRequest(BaseModel):
     use_cot_language: bool = True
     is_format_caption: bool = False
     allow_lm_batch: bool = True
+    track_name: Optional[str] = None
+    track_classes: Optional[List[str]] = None
 
     lm_temperature: float = 0.85
     lm_cfg_scale: float = 2.5
@@ -887,6 +893,45 @@ class RequestParser:
 
     def bool(self, name: str, default: bool = False) -> bool:
         return _to_bool(self.get(name), default)
+
+
+def _validate_audio_path(path: Optional[str]) -> Optional[str]:
+    """Validate a user-supplied audio file path to prevent path traversal attacks.
+
+    Accepts absolute paths strictly only if they are within the system temporary directory.
+    Otherwise, rejects absolute paths and paths containing '..' traversal sequences.
+    
+    Returns the validated, normalized path or None if the input is None/empty.
+    Raises HTTPException 400 if the path is unsafe.
+    """
+    if not path:
+        return None
+    
+    # Resolve requested path and system temp path to normalized absolute forms
+    import tempfile
+    system_temp = os.path.realpath(tempfile.gettempdir())
+    requested_path = os.path.realpath(path)
+
+    # SECURE CHECK: Use os.path.commonpath to verify directory boundary integrity.
+    # This prevents prefix bypasses (e.g., /tmp_evil when /tmp is allowed).
+    try:
+        is_in_temp = os.path.commonpath([system_temp, requested_path]) == system_temp
+    except ValueError:
+        # Occurs on Windows if paths are on different drives
+        is_in_temp = False
+
+    if is_in_temp:
+        # Accept server-generated files in temp
+        return requested_path
+
+    # Reject manual absolute paths outside of temp
+    if os.path.isabs(path):
+        raise HTTPException(status_code=400, detail="absolute audio file paths are not allowed")
+    # Reject path traversal via '..' components
+    normalized = os.path.normpath(path)
+    if ".." in normalized.split(os.sep):
+        raise HTTPException(status_code=400, detail="path traversal in audio file paths is not allowed")
+    return path
 
 
 async def _save_upload_to_temp(upload: StarletteUploadFile, *, prefix: str) -> str:
@@ -1472,7 +1517,25 @@ def create_app() -> FastAPI:
                 # This matches gradio behavior which uses TASK_INSTRUCTIONS for each task type
                 instruction_to_use = req.instruction
                 if instruction_to_use == DEFAULT_DIT_INSTRUCTION and req.task_type in TASK_INSTRUCTIONS:
-                    instruction_to_use = TASK_INSTRUCTIONS[req.task_type]
+                    raw_instruction = TASK_INSTRUCTIONS[req.task_type]
+                    
+                    if req.task_type == "complete":
+                         #  Use track_classes joined by pipes
+                         if req.track_classes:
+                             # Join list items: ["Drums", "Bass"] -> "DRUMS | BASS"
+                             classes_str = " | ".join([str(t).upper() for t in req.track_classes])
+                             # Use the raw instruction template from constants
+                             # Format: "Complete the track with {TRACK_CLASSES}:"
+                             instruction_to_use = raw_instruction.format(TRACK_CLASSES=classes_str)
+                         else:
+                             # Fallback if no classes provided
+                             instruction_to_use = TASK_INSTRUCTIONS.get("complete_default", raw_instruction)
+
+                    elif "{TRACK_NAME}" in raw_instruction and req.track_name:
+                        # Logic for extract/lego
+                        instruction_to_use = raw_instruction.format(TRACK_NAME=req.track_name.upper())
+                    else:
+                        instruction_to_use = raw_instruction
 
                 # Build GenerationParams using unified interface
                 # Note: thinking controls LM code generation, sample_mode only affects CoT metas
@@ -1522,11 +1585,30 @@ def create_app() -> FastAPI:
 
                 # Build GenerationConfig - default to 2 audios like gradio_ui
                 batch_size = req.batch_size if req.batch_size is not None else 2
+
+                # Resolve seed(s) from req.seed into List[int] for GenerationConfig.seeds
+                resolved_seeds = None
+                if not req.use_random_seed and req.seed is not None:
+                    if isinstance(req.seed, int):
+                        if req.seed >= 0:
+                            resolved_seeds = [req.seed]
+                    elif isinstance(req.seed, str):
+                        resolved_seeds = []
+                        for s in req.seed.split(","):
+                            s = s.strip()
+                            if s and s != "-1":
+                                try:
+                                    resolved_seeds.append(int(float(s)))
+                                except (ValueError, TypeError):
+                                    pass
+                        if not resolved_seeds:
+                            resolved_seeds = None
+
                 config = GenerationConfig(
                     batch_size=batch_size,
                     allow_lm_batch=req.allow_lm_batch,
                     use_random_seed=req.use_random_seed,
-                    seeds=None,  # Let unified logic handle seed generation
+                    seeds=resolved_seeds,
                     audio_format=req.audio_format,
                     constrained_decoding_debug=req.constrained_decoding_debug,
                 )
@@ -1870,15 +1952,17 @@ def create_app() -> FastAPI:
         # =================================================================
         # Initialize models at startup (not lazily on first request)
         # =================================================================
-        print("[API Server] Initializing models at startup...")
 
-        # Detect GPU memory and get configuration
+        # Check if --no-init flag is set (skip model loading at startup)
+        no_init = _env_bool("ACESTEP_NO_INIT", False)
+
+        # Detect GPU memory and get configuration (always needed)
         gpu_config = get_gpu_config()
         set_global_gpu_config(gpu_config)
         app.state.gpu_config = gpu_config
 
         gpu_memory_gb = gpu_config.gpu_memory_gb
-        auto_offload = gpu_memory_gb > 0 and gpu_memory_gb < VRAM_16GB_MIN_GB
+        auto_offload = gpu_memory_gb > 0 and gpu_memory_gb < VRAM_AUTO_OFFLOAD_THRESHOLD_GB
 
         # Print GPU configuration info
         print(f"\n{'='*60}")
@@ -1894,226 +1978,234 @@ def create_app() -> FastAPI:
         print(f"  Available LM Models: {gpu_config.available_lm_models or 'None'}")
         print(f"{'='*60}\n")
 
-        if auto_offload:
-            print(f"[API Server] Auto-enabling CPU offload (GPU < 16GB)")
-        elif gpu_memory_gb > 0:
-            print(f"[API Server] CPU offload disabled by default (GPU >= 16GB)")
+        if no_init:
+            print("[API Server] --no-init mode: Skipping all model loading at startup")
+            print("[API Server] Models will be lazy-loaded on first request")
+            print("[API Server] Server is ready to accept requests (models not loaded yet)")
         else:
-            print("[API Server] No GPU detected, running on CPU")
+            print("[API Server] Initializing models at startup...")
 
-        project_root = _get_project_root()
-        config_path = os.getenv("ACESTEP_CONFIG_PATH", "acestep-v15-turbo")
-        device = os.getenv("ACESTEP_DEVICE", "auto")
-        use_flash_attention = _env_bool("ACESTEP_USE_FLASH_ATTENTION", True)
-
-        # Auto-determine offload settings based on GPU config if not explicitly set
-        offload_to_cpu_env = os.getenv("ACESTEP_OFFLOAD_TO_CPU")
-        if offload_to_cpu_env is not None:
-            offload_to_cpu = _env_bool("ACESTEP_OFFLOAD_TO_CPU", False)
-        else:
-            offload_to_cpu = auto_offload
             if auto_offload:
-                print(f"[API Server] Auto-setting offload_to_cpu=True based on GPU memory")
+                print(f"[API Server] Auto-enabling CPU offload (GPU < 16GB)")
+            elif gpu_memory_gb > 0:
+                print(f"[API Server] CPU offload disabled by default (GPU >= 16GB)")
+            else:
+                print("[API Server] No GPU detected, running on CPU")
 
-        offload_dit_to_cpu = _env_bool("ACESTEP_OFFLOAD_DIT_TO_CPU", False)
+            project_root = _get_project_root()
+            config_path = os.getenv("ACESTEP_CONFIG_PATH", "acestep-v15-turbo")
+            device = os.getenv("ACESTEP_DEVICE", "auto")
+            use_flash_attention = _env_bool("ACESTEP_USE_FLASH_ATTENTION", True)
 
-        # Checkpoint directory
-        checkpoint_dir = os.path.join(project_root, "checkpoints")
-        os.makedirs(checkpoint_dir, exist_ok=True)
+            # Auto-determine offload settings based on GPU config if not explicitly set
+            offload_to_cpu_env = os.getenv("ACESTEP_OFFLOAD_TO_CPU")
+            if offload_to_cpu_env is not None:
+                offload_to_cpu = _env_bool("ACESTEP_OFFLOAD_TO_CPU", False)
+            else:
+                offload_to_cpu = auto_offload
+                if auto_offload:
+                    print(f"[API Server] Auto-setting offload_to_cpu=True based on GPU memory")
 
-        # Download and initialize primary DiT model
-        dit_model_name = _get_model_name(config_path)
-        if dit_model_name:
-            try:
-                _ensure_model_downloaded(dit_model_name, checkpoint_dir)
-            except Exception as e:
-                print(f"[API Server] Warning: Failed to download DiT model: {e}")
+            offload_dit_to_cpu = _env_bool("ACESTEP_OFFLOAD_DIT_TO_CPU", False)
 
-        # Download VAE model
-        try:
-            _ensure_model_downloaded("vae", checkpoint_dir)
-        except Exception as e:
-            print(f"[API Server] Warning: Failed to download VAE model: {e}")
+            # Checkpoint directory
+            checkpoint_dir = os.path.join(project_root, "checkpoints")
+            os.makedirs(checkpoint_dir, exist_ok=True)
 
-        print(f"[API Server] Loading primary DiT model: {config_path}")
-        status_msg, ok = handler.initialize_service(
-            project_root=project_root,
-            config_path=config_path,
-            device=device,
-            use_flash_attention=use_flash_attention,
-            compile_model=False,
-            offload_to_cpu=offload_to_cpu,
-            offload_dit_to_cpu=offload_dit_to_cpu,
-        )
-        if not ok:
-            app.state._init_error = status_msg
-            print(f"[API Server] ERROR: Primary model failed to load: {status_msg}")
-            raise RuntimeError(status_msg)
-        app.state._initialized = True
-        print(f"[API Server] Primary model loaded: {_get_model_name(config_path)}")
-
-        # Initialize secondary model if configured
-        if handler2 and config_path2:
-            model2_name = _get_model_name(config_path2)
-            if model2_name:
+            # Download and initialize primary DiT model
+            dit_model_name = _get_model_name(config_path)
+            if dit_model_name:
                 try:
-                    _ensure_model_downloaded(model2_name, checkpoint_dir)
+                    _ensure_model_downloaded(dit_model_name, checkpoint_dir)
                 except Exception as e:
-                    print(f"[API Server] Warning: Failed to download secondary model: {e}")
+                    print(f"[API Server] Warning: Failed to download DiT model: {e}")
 
-            print(f"[API Server] Loading secondary DiT model: {config_path2}")
+            # Download VAE model
             try:
-                status_msg2, ok2 = handler2.initialize_service(
-                    project_root=project_root,
-                    config_path=config_path2,
-                    device=device,
-                    use_flash_attention=use_flash_attention,
-                    compile_model=False,
-                    offload_to_cpu=offload_to_cpu,
-                    offload_dit_to_cpu=offload_dit_to_cpu,
-                )
-                app.state._initialized2 = ok2
-                if ok2:
-                    print(f"[API Server] Secondary model loaded: {model2_name}")
-                else:
-                    print(f"[API Server] Warning: Secondary model failed: {status_msg2}")
+                _ensure_model_downloaded("vae", checkpoint_dir)
             except Exception as e:
-                print(f"[API Server] Warning: Failed to initialize secondary model: {e}")
-                app.state._initialized2 = False
+                print(f"[API Server] Warning: Failed to download VAE model: {e}")
 
-        # Initialize third model if configured
-        if handler3 and config_path3:
-            model3_name = _get_model_name(config_path3)
-            if model3_name:
-                try:
-                    _ensure_model_downloaded(model3_name, checkpoint_dir)
-                except Exception as e:
-                    print(f"[API Server] Warning: Failed to download third model: {e}")
-
-            print(f"[API Server] Loading third DiT model: {config_path3}")
-            try:
-                status_msg3, ok3 = handler3.initialize_service(
-                    project_root=project_root,
-                    config_path=config_path3,
-                    device=device,
-                    use_flash_attention=use_flash_attention,
-                    compile_model=False,
-                    offload_to_cpu=offload_to_cpu,
-                    offload_dit_to_cpu=offload_dit_to_cpu,
-                )
-                app.state._initialized3 = ok3
-                if ok3:
-                    print(f"[API Server] Third model loaded: {model3_name}")
-                else:
-                    print(f"[API Server] Warning: Third model failed: {status_msg3}")
-            except Exception as e:
-                print(f"[API Server] Warning: Failed to initialize third model: {e}")
-                app.state._initialized3 = False
-
-        # Initialize LLM model based on GPU configuration
-        # ACESTEP_INIT_LLM controls LLM initialization:
-        #   - "auto" / empty / not set: Use GPU config default (auto-detect)
-        #   - "true"/"1"/"yes": Force enable LLM after GPU config is applied
-        #   - "false"/"0"/"no": Force disable LLM
-        #
-        # Flow: GPU detection → model validation → ACESTEP_INIT_LLM override
-        # This ensures GPU optimizations (offload, quantization, etc.) are always applied.
-        init_llm_env = os.getenv("ACESTEP_INIT_LLM", "").strip().lower()
-
-        # Step 1: Start with GPU auto-detection result
-        init_llm = gpu_config.init_lm_default
-        print(f"[API Server] GPU auto-detection: init_llm={init_llm} (VRAM: {gpu_config.gpu_memory_gb:.1f}GB, tier: {gpu_config.tier})")
-
-        # Step 2: Apply user override if set
-        if not init_llm_env or init_llm_env == "auto":
-            print(f"[API Server] ACESTEP_INIT_LLM=auto, using GPU auto-detection result")
-        elif init_llm_env in {"1", "true", "yes", "y", "on"}:
-            if init_llm:
-                print(f"[API Server] ACESTEP_INIT_LLM=true (GPU already supports LLM, no override needed)")
-            else:
-                init_llm = True
-                print(f"[API Server] ACESTEP_INIT_LLM=true, overriding GPU auto-detection (force enable)")
-        else:
-            if not init_llm:
-                print(f"[API Server] ACESTEP_INIT_LLM=false (GPU already disabled LLM, no override needed)")
-            else:
-                init_llm = False
-                print(f"[API Server] ACESTEP_INIT_LLM=false, overriding GPU auto-detection (force disable)")
-
-        if init_llm:
-            print("[API Server] Loading LLM model...")
-
-            # Auto-select LM model based on GPU config if not explicitly set
-            lm_model_path_env = os.getenv("ACESTEP_LM_MODEL_PATH", "").strip()
-            if lm_model_path_env:
-                lm_model_path = lm_model_path_env
-                print(f"[API Server] Using user-specified LM model: {lm_model_path}")
-            else:
-                # Get recommended LM model for this GPU tier
-                recommended_lm = get_recommended_lm_model(gpu_config)
-                if recommended_lm:
-                    lm_model_path = recommended_lm
-                    print(f"[API Server] Auto-selected LM model: {lm_model_path} based on GPU tier")
-                else:
-                    # No recommended model (GPU tier too low), default to smallest
-                    lm_model_path = "acestep-5Hz-lm-0.6B"
-                    print(f"[API Server] No recommended model for this GPU tier, using smallest: {lm_model_path}")
-
-            # Validate LM model support (warning only, does not block)
-            is_supported, warning_msg = is_lm_model_supported(lm_model_path, gpu_config)
-            if not is_supported:
-                print(f"[API Server] Warning: {warning_msg}")
-                # Try to fall back to a supported model
-                recommended_lm = get_recommended_lm_model(gpu_config)
-                if recommended_lm:
-                    lm_model_path = recommended_lm
-                    print(f"[API Server] Falling back to supported LM model: {lm_model_path}")
-                else:
-                    # No supported model, but user may have forced init
-                    print(f"[API Server] No GPU-validated LM model available, attempting {lm_model_path} anyway (may cause OOM)")
-
-        if init_llm:
-            lm_backend = os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower()
-            if lm_backend not in {"vllm", "pt", "mlx"}:
-                lm_backend = "vllm"
-            lm_device = os.getenv("ACESTEP_LM_DEVICE", device)
-
-            # Auto-determine LM offload based on GPU config
-            lm_offload_env = os.getenv("ACESTEP_LM_OFFLOAD_TO_CPU")
-            if lm_offload_env is not None:
-                lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
-            else:
-                lm_offload = offload_to_cpu
-
-            try:
-                _ensure_model_downloaded(lm_model_path, checkpoint_dir)
-            except Exception as e:
-                print(f"[API Server] Warning: Failed to download LLM model: {e}")
-
-            llm_status, llm_ok = llm_handler.initialize(
-                checkpoint_dir=checkpoint_dir,
-                lm_model_path=lm_model_path,
-                backend=lm_backend,
-                device=lm_device,
-                offload_to_cpu=lm_offload,
-                dtype=None,
+            print(f"[API Server] Loading primary DiT model: {config_path}")
+            status_msg, ok = handler.initialize_service(
+                project_root=project_root,
+                config_path=config_path,
+                device=device,
+                use_flash_attention=use_flash_attention,
+                compile_model=False,
+                offload_to_cpu=offload_to_cpu,
+                offload_dit_to_cpu=offload_dit_to_cpu,
             )
-            if llm_ok:
-                app.state._llm_initialized = True
-                print(f"[API Server] LLM model loaded: {lm_model_path}")
-            else:
-                app.state._llm_init_error = llm_status
-                print(f"[API Server] Warning: LLM model failed to load: {llm_status}")
-        else:
-            print("[API Server] Skipping LLM initialization (disabled or not supported for this GPU)")
-            app.state._llm_initialized = False
-            # Disable lazy loading of LLM - don't try to load it later during requests
-            app.state._llm_lazy_load_disabled = True
-            print("[API Server] LLM lazy loading disabled. To enable LLM:")
-            print("[API Server]   - Set ACESTEP_INIT_LLM=true in .env or environment")
-            print("[API Server]   - Or use --init-llm command line flag")
+            if not ok:
+                app.state._init_error = status_msg
+                print(f"[API Server] ERROR: Primary model failed to load: {status_msg}")
+                raise RuntimeError(status_msg)
+            app.state._initialized = True
+            print(f"[API Server] Primary model loaded: {_get_model_name(config_path)}")
 
-        print("[API Server] All models initialized successfully!")
+            # Initialize secondary model if configured
+            if handler2 and config_path2:
+                model2_name = _get_model_name(config_path2)
+                if model2_name:
+                    try:
+                        _ensure_model_downloaded(model2_name, checkpoint_dir)
+                    except Exception as e:
+                        print(f"[API Server] Warning: Failed to download secondary model: {e}")
+
+                print(f"[API Server] Loading secondary DiT model: {config_path2}")
+                try:
+                    status_msg2, ok2 = handler2.initialize_service(
+                        project_root=project_root,
+                        config_path=config_path2,
+                        device=device,
+                        use_flash_attention=use_flash_attention,
+                        compile_model=False,
+                        offload_to_cpu=offload_to_cpu,
+                        offload_dit_to_cpu=offload_dit_to_cpu,
+                    )
+                    app.state._initialized2 = ok2
+                    if ok2:
+                        print(f"[API Server] Secondary model loaded: {model2_name}")
+                    else:
+                        print(f"[API Server] Warning: Secondary model failed: {status_msg2}")
+                except Exception as e:
+                    print(f"[API Server] Warning: Failed to initialize secondary model: {e}")
+                    app.state._initialized2 = False
+
+            # Initialize third model if configured
+            if handler3 and config_path3:
+                model3_name = _get_model_name(config_path3)
+                if model3_name:
+                    try:
+                        _ensure_model_downloaded(model3_name, checkpoint_dir)
+                    except Exception as e:
+                        print(f"[API Server] Warning: Failed to download third model: {e}")
+
+                print(f"[API Server] Loading third DiT model: {config_path3}")
+                try:
+                    status_msg3, ok3 = handler3.initialize_service(
+                        project_root=project_root,
+                        config_path=config_path3,
+                        device=device,
+                        use_flash_attention=use_flash_attention,
+                        compile_model=False,
+                        offload_to_cpu=offload_to_cpu,
+                        offload_dit_to_cpu=offload_dit_to_cpu,
+                    )
+                    app.state._initialized3 = ok3
+                    if ok3:
+                        print(f"[API Server] Third model loaded: {model3_name}")
+                    else:
+                        print(f"[API Server] Warning: Third model failed: {status_msg3}")
+                except Exception as e:
+                    print(f"[API Server] Warning: Failed to initialize third model: {e}")
+                    app.state._initialized3 = False
+
+            # Initialize LLM model based on GPU configuration
+            # ACESTEP_INIT_LLM controls LLM initialization:
+            #   - "auto" / empty / not set: Use GPU config default (auto-detect)
+            #   - "true"/"1"/"yes": Force enable LLM after GPU config is applied
+            #   - "false"/"0"/"no": Force disable LLM
+            #
+            # Flow: GPU detection → model validation → ACESTEP_INIT_LLM override
+            # This ensures GPU optimizations (offload, quantization, etc.) are always applied.
+            init_llm_env = os.getenv("ACESTEP_INIT_LLM", "").strip().lower()
+
+            # Step 1: Start with GPU auto-detection result
+            init_llm = gpu_config.init_lm_default
+            print(f"[API Server] GPU auto-detection: init_llm={init_llm} (VRAM: {gpu_config.gpu_memory_gb:.1f}GB, tier: {gpu_config.tier})")
+
+            # Step 2: Apply user override if set
+            if not init_llm_env or init_llm_env == "auto":
+                print(f"[API Server] ACESTEP_INIT_LLM=auto, using GPU auto-detection result")
+            elif init_llm_env in {"1", "true", "yes", "y", "on"}:
+                if init_llm:
+                    print(f"[API Server] ACESTEP_INIT_LLM=true (GPU already supports LLM, no override needed)")
+                else:
+                    init_llm = True
+                    print(f"[API Server] ACESTEP_INIT_LLM=true, overriding GPU auto-detection (force enable)")
+            else:
+                if not init_llm:
+                    print(f"[API Server] ACESTEP_INIT_LLM=false (GPU already disabled LLM, no override needed)")
+                else:
+                    init_llm = False
+                    print(f"[API Server] ACESTEP_INIT_LLM=false, overriding GPU auto-detection (force disable)")
+
+            if init_llm:
+                print("[API Server] Loading LLM model...")
+
+                # Auto-select LM model based on GPU config if not explicitly set
+                lm_model_path_env = os.getenv("ACESTEP_LM_MODEL_PATH", "").strip()
+                if lm_model_path_env:
+                    lm_model_path = lm_model_path_env
+                    print(f"[API Server] Using user-specified LM model: {lm_model_path}")
+                else:
+                    # Get recommended LM model for this GPU tier
+                    recommended_lm = get_recommended_lm_model(gpu_config)
+                    if recommended_lm:
+                        lm_model_path = recommended_lm
+                        print(f"[API Server] Auto-selected LM model: {lm_model_path} based on GPU tier")
+                    else:
+                        # No recommended model (GPU tier too low), default to smallest
+                        lm_model_path = "acestep-5Hz-lm-0.6B"
+                        print(f"[API Server] No recommended model for this GPU tier, using smallest: {lm_model_path}")
+
+                # Validate LM model support (warning only, does not block)
+                is_supported, warning_msg = is_lm_model_supported(lm_model_path, gpu_config)
+                if not is_supported:
+                    print(f"[API Server] Warning: {warning_msg}")
+                    # Try to fall back to a supported model
+                    recommended_lm = get_recommended_lm_model(gpu_config)
+                    if recommended_lm:
+                        lm_model_path = recommended_lm
+                        print(f"[API Server] Falling back to supported LM model: {lm_model_path}")
+                    else:
+                        # No supported model, but user may have forced init
+                        print(f"[API Server] No GPU-validated LM model available, attempting {lm_model_path} anyway (may cause OOM)")
+
+            if init_llm:
+                lm_backend = os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower()
+                if lm_backend not in {"vllm", "pt", "mlx"}:
+                    lm_backend = "vllm"
+                lm_device = os.getenv("ACESTEP_LM_DEVICE", device)
+
+                # Auto-determine LM offload based on GPU config
+                lm_offload_env = os.getenv("ACESTEP_LM_OFFLOAD_TO_CPU")
+                if lm_offload_env is not None:
+                    lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
+                else:
+                    lm_offload = offload_to_cpu
+
+                lm_model_name = _get_model_name(lm_model_path)
+                try:
+                    _ensure_model_downloaded(lm_model_name, checkpoint_dir)
+                except Exception as e:
+                    print(f"[API Server] Warning: Failed to download LLM model: {e}")
+
+                llm_status, llm_ok = llm_handler.initialize(
+                    checkpoint_dir=checkpoint_dir,
+                    lm_model_path=lm_model_path,
+                    backend=lm_backend,
+                    device=lm_device,
+                    offload_to_cpu=lm_offload,
+                    dtype=None,
+                )
+                if llm_ok:
+                    app.state._llm_initialized = True
+                    print(f"[API Server] LLM model loaded: {lm_model_path}")
+                else:
+                    app.state._llm_init_error = llm_status
+                    print(f"[API Server] Warning: LLM model failed to load: {llm_status}")
+            else:
+                print("[API Server] Skipping LLM initialization (disabled or not supported for this GPU)")
+                app.state._llm_initialized = False
+                # Disable lazy loading of LLM - don't try to load it later during requests
+                app.state._llm_lazy_load_disabled = True
+                print("[API Server] LLM lazy loading disabled. To enable LLM:")
+                print("[API Server]   - Set ACESTEP_INIT_LLM=true in .env or environment")
+                print("[API Server]   - Or use --init-llm command line flag")
+
+            print("[API Server] All models initialized successfully!")
 
         try:
             yield
@@ -2124,6 +2216,16 @@ def create_app() -> FastAPI:
             executor.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="ACE-Step API", version="1.0", lifespan=lifespan)
+
+    # Enable CORS for browser-based frontends (e.g. studio.html opened via file://)
+    # Restricted to localhost origins and the "null" origin (file:// protocol)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["null", "http://localhost", "http://127.0.0.1"],
+        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization"],
+    )
 
     # Mount OpenRouter-compatible endpoints (/v1/chat/completions, /v1/models)
     from acestep.openrouter_adapter import create_openrouter_router
@@ -2151,6 +2253,15 @@ def create_app() -> FastAPI:
 
         def _build_request(p: RequestParser, **kwargs) -> GenerateMusicRequest:
             """Build GenerateMusicRequest from parsed parameters."""
+            # Pop audio path overrides from kwargs to avoid duplicate keyword arguments
+            # when callers (multipart/form, url-encoded, raw body) pass them explicitly.
+            ref_audio = kwargs.pop("reference_audio_path", None) or p.str("reference_audio_path") or None
+            src_audio = kwargs.pop("src_audio_path", None) or p.str("src_audio_path") or None
+
+            t_classes = p.get("track_classes")
+            if t_classes is not None and isinstance(t_classes, str):
+                t_classes = [t_classes]
+
             return GenerateMusicRequest(
                 prompt=p.str("prompt"),
                 lyrics=p.str("lyrics"),
@@ -2175,8 +2286,8 @@ def create_app() -> FastAPI:
                 repainting_end=p.float("repainting_end"),
                 instruction=p.str("instruction", DEFAULT_DIT_INSTRUCTION),
                 audio_cover_strength=p.float("audio_cover_strength", 1.0),
-                reference_audio_path=p.str("reference_audio_path") or None,
-                src_audio_path=p.str("src_audio_path") or None,
+                reference_audio_path=ref_audio,
+                src_audio_path=src_audio,
                 task_type=p.str("task_type", "text2music"),
                 use_adg=p.bool("use_adg"),
                 cfg_interval_start=p.float("cfg_interval_start", 0.0),
@@ -2199,6 +2310,8 @@ def create_app() -> FastAPI:
                 use_cot_language=p.bool("use_cot_language", True),
                 is_format_caption=p.bool("is_format_caption"),
                 allow_lm_batch=p.bool("allow_lm_batch", True),
+                track_name=p.str("track_name"),
+                track_classes=t_classes,
                 **kwargs,
             )
 
@@ -2207,18 +2320,40 @@ def create_app() -> FastAPI:
             if not isinstance(body, dict):
                 raise HTTPException(status_code=400, detail="JSON payload must be an object")
             verify_token_from_request(body, authorization)
-            req = _build_request(RequestParser(body))
+            
+            # Explicitly validate manual string paths from JSON input
+            p = RequestParser(body)
+            req = _build_request(
+                p,
+                reference_audio_path=_validate_audio_path(p.str("reference_audio_path") or None),
+                src_audio_path=_validate_audio_path(p.str("src_audio_path") or None)
+            )
 
         elif content_type.endswith("+json"):
             body = await request.json()
             if not isinstance(body, dict):
                 raise HTTPException(status_code=400, detail="JSON payload must be an object")
             verify_token_from_request(body, authorization)
-            req = _build_request(RequestParser(body))
+            
+            p = RequestParser(body)
+            req = _build_request(
+                p,
+                reference_audio_path=_validate_audio_path(p.str("reference_audio_path") or None),
+                src_audio_path=_validate_audio_path(p.str("src_audio_path") or None)
+            )
 
         elif content_type.startswith("multipart/form-data"):
             form = await request.form()
-            form_dict = {k: v for k, v in form.items() if not hasattr(v, 'read')}
+            
+            # Parse form data correctly to support lists ---
+            form_dict = {}
+            for k in form.keys():
+                vals = [v for v in form.getlist(k) if not hasattr(v, 'read')]
+                if len(vals) == 1:
+                    form_dict[k] = vals[0]
+                elif len(vals) > 1:
+                    form_dict[k] = vals
+
             verify_token_from_request(form_dict, authorization)
 
             # Support both naming conventions: ref_audio/reference_audio, ctx_audio/src_audio
@@ -2232,16 +2367,16 @@ def create_app() -> FastAPI:
                 reference_audio_path = await _save_upload_to_temp(ref_up, prefix="ref_audio")
                 temp_files.append(reference_audio_path)
             else:
-                reference_audio_path = str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None
+                reference_audio_path = _validate_audio_path(str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None)
 
             if isinstance(ctx_up, StarletteUploadFile):
                 src_audio_path = await _save_upload_to_temp(ctx_up, prefix="ctx_audio")
                 temp_files.append(src_audio_path)
             else:
-                src_audio_path = str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None
+                src_audio_path = _validate_audio_path(str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None)
 
             req = _build_request(
-                RequestParser(dict(form)),
+                RequestParser(dict(form_dict)),
                 reference_audio_path=reference_audio_path,
                 src_audio_path=src_audio_path,
             )
@@ -2250,8 +2385,8 @@ def create_app() -> FastAPI:
             form = await request.form()
             form_dict = dict(form)
             verify_token_from_request(form_dict, authorization)
-            reference_audio_path = str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None
-            src_audio_path = str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None
+            reference_audio_path = _validate_audio_path(str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None)
+            src_audio_path = _validate_audio_path(str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None)
             req = _build_request(
                 RequestParser(form_dict),
                 reference_audio_path=reference_audio_path,
@@ -2267,7 +2402,12 @@ def create_app() -> FastAPI:
                     body = json.loads(raw.decode("utf-8"))
                     if isinstance(body, dict):
                         verify_token_from_request(body, authorization)
-                        req = _build_request(RequestParser(body))
+                        p = RequestParser(body)
+                        req = _build_request(
+                            p,
+                            reference_audio_path=_validate_audio_path(p.str("reference_audio_path") or None),
+                            src_audio_path=_validate_audio_path(p.str("src_audio_path") or None)
+                        )
                     else:
                         raise HTTPException(status_code=400, detail="JSON payload must be an object")
                 except HTTPException:
@@ -2282,8 +2422,8 @@ def create_app() -> FastAPI:
                 parsed = urllib.parse.parse_qs(raw.decode("utf-8"), keep_blank_values=True)
                 flat = {k: (v[0] if isinstance(v, list) and v else v) for k, v in parsed.items()}
                 verify_token_from_request(flat, authorization)
-                reference_audio_path = str(flat.get("ref_audio_path") or flat.get("reference_audio_path") or "").strip() or None
-                src_audio_path = str(flat.get("ctx_audio_path") or flat.get("src_audio_path") or "").strip() or None
+                reference_audio_path = _validate_audio_path(str(flat.get("ref_audio_path") or flat.get("reference_audio_path") or "").strip() or None)
+                src_audio_path = _validate_audio_path(str(flat.get("ctx_audio_path") or flat.get("src_audio_path") or "").strip() or None)
                 req = _build_request(
                     RequestParser(flat),
                     reference_audio_path=reference_audio_path,
@@ -2734,6 +2874,13 @@ def main() -> None:
         default=os.getenv("ACESTEP_LM_MODEL_PATH", ""),
         help="LM model to load (e.g., 'acestep-5Hz-lm-0.6B'). Default from ACESTEP_LM_MODEL_PATH.",
     )
+    parser.add_argument(
+        "--no-init",
+        action="store_true",
+        default=_env_bool("ACESTEP_NO_INIT", False),
+        help="Skip model loading at startup (models will be lazy-loaded on first request). "
+             "Can also be set via ACESTEP_NO_INIT=true environment variable.",
+    )
     args = parser.parse_args()
 
     # Set API key from command line argument
@@ -2754,6 +2901,11 @@ def main() -> None:
     if args.lm_model_path:
         os.environ["ACESTEP_LM_MODEL_PATH"] = args.lm_model_path
         print(f"[API Server] Using LM model: {args.lm_model_path}")
+
+    # Set no-init flag
+    if args.no_init:
+        os.environ["ACESTEP_NO_INIT"] = "true"
+        print("[API Server] --no-init: Models will NOT be loaded at startup (lazy load on first request)")
 
     # IMPORTANT: in-memory queue/store -> workers MUST be 1
     uvicorn.run(

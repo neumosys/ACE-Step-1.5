@@ -66,7 +66,7 @@ from acestep.handler import AceStepHandler
 from acestep.llm_inference import LLMHandler
 from acestep.inference import GenerationParams, GenerationConfig, generate_music, create_sample, format_sample
 from acestep.constants import DEFAULT_DIT_INSTRUCTION, TASK_INSTRUCTIONS
-from acestep.gpu_config import get_gpu_config
+from acestep.gpu_config import get_gpu_config, set_global_gpu_config, is_mps_platform
 import torch
 
 
@@ -242,7 +242,7 @@ def _extract_caption_lyrics_from_formatted_prompt(formatted_prompt: str) -> Tupl
     lyrics = matches[-1].group(2)
 
     # Trim lyrics if chat-template markers appear after the user message.
-    cut_markers = ["<|eot_id|>", "<|start_header_id|>", "<|assistant|>", "<|user|>", "<|system|>"]
+    cut_markers = ["<|eot_id|>", "<|start_header_id|>", "<|assistant|>", "<|user|>", "<|system|>", "<|im_end|>", "<|im_start|>"]
     cut_at = len(lyrics)
     for marker in cut_markers:
         pos = lyrics.find(marker)
@@ -263,21 +263,36 @@ def _extract_instruction_from_formatted_prompt(formatted_prompt: str) -> Optiona
 
 
 def _extract_cot_metadata_from_formatted_prompt(formatted_prompt: str) -> dict:
-    """Best-effort extraction of COT metadata from a formatted prompt string."""
+    """Best-effort extraction of COT metadata from a formatted prompt string,
+    supporting multi-line values.
+    """
     matches = list(re.finditer(r"<think>\n(.*?)\n</think>", formatted_prompt, re.DOTALL))
     if not matches:
         return {}
     block = matches[-1].group(1)
     metadata = {}
+    current_key = None
+    current_value_lines = []
+
     for line in block.splitlines():
         line = line.strip()
-        if not line or ":" not in line:
+        if not line:
             continue
-        key, value = line.split(":", 1)
-        key = key.strip().lower()
-        value = value.strip()
-        if key:
-            metadata[key] = value
+
+        key_match = re.match(r"^(\w+):\s*(.*)", line)
+        if key_match:
+            if current_key:
+                metadata[current_key] = " ".join(current_value_lines).strip()
+
+            current_key = key_match.group(1).strip().lower()
+            current_value_lines = [key_match.group(2).strip()]
+        else:
+            if current_key:
+                current_value_lines.append(line)
+
+    if current_key and current_value_lines:
+        metadata[current_key] = " ".join(current_value_lines).strip()
+
     return metadata
 
 
@@ -840,7 +855,7 @@ def run_wizard(args, configure_only: bool = False, default_config_path: Optional
 
         args.batch_size = _prompt_int(
             "Number of outputs (audio clips) to generate",
-            args.batch_size if args.batch_size is not None else 1,
+            args.batch_size if args.batch_size is not None else 2,
             min_value=1,
         )
 
@@ -977,7 +992,10 @@ def main():
     """
 
     gpu_config = get_gpu_config()
-    auto_offload = gpu_config.gpu_memory_gb > 0 and gpu_config.gpu_memory_gb < 16
+    set_global_gpu_config(gpu_config)
+    mps_available = is_mps_platform()
+    # Mac (Apple Silicon) uses unified memory — offloading provides no benefit
+    auto_offload = (not mps_available) and gpu_config.gpu_memory_gb > 0 and gpu_config.gpu_memory_gb < 16
     print(f"\n{'='*60}")
     print("GPU Configuration Detected:")
     print(f"{'='*60}")
@@ -1010,6 +1028,13 @@ def main():
     parser.add_argument("-c", "--config", type=str, help="Path to a TOML configuration file to load.")
     parser.add_argument("--configure", action="store_true", help="Run wizard to save configuration without generating.")
     parser.add_argument(
+        "--backend",
+        type=str,
+        default=None,
+        choices=["vllm", "pt", "mlx"],
+        help="5Hz LM backend. Auto-detected if not specified: 'mlx' on Apple Silicon, 'vllm' on CUDA, 'pt' otherwise.",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -1020,12 +1045,24 @@ def main():
     _configure_logging(level=cli_args.log_level)
 
     default_batch_size = 1 if not cli_args.config else config_defaults.batch_size
+
+    # Auto-detect MLX on Apple Silicon, fall back to vllm
+    if mps_available:
+        try:
+            import mlx.core  # noqa: F401
+            default_backend = "mlx"
+            print("Apple Silicon detected with MLX available. Using MLX backend.")
+        except ImportError:
+            default_backend = "vllm"
+    else:
+        default_backend = "vllm"
+
     defaults = {
         "project_root": _get_project_root(),
         "config_path": None,
         "checkpoint_dir": os.path.join(_get_project_root(), "checkpoints"),
         "lm_model_path": None,
-        "backend": "vllm",
+        "backend": default_backend,
         "device": "auto",
         "use_flash_attention": None,
         "offload_to_cpu": auto_offload,
@@ -1098,6 +1135,10 @@ def main():
         for key, value in config_from_file.items():
             setattr(args, key, value)
         args.config = cli_args.config
+
+    # CLI --backend overrides config file and auto-detection
+    if cli_args.backend is not None:
+        args.backend = cli_args.backend
 
     if cli_args.configure:
         args, _ = run_wizard(
@@ -1259,6 +1300,8 @@ def main():
     # --- Handler Initialization ---
     if args.backend == "pyTorch":
         args.backend = "pt"
+    if args.backend not in {"vllm", "pt", "mlx"}:
+        args.backend = "vllm"
 
     print("Initializing ACE-Step handlers...")
     dit_handler = AceStepHandler()
@@ -1563,37 +1606,7 @@ def main():
                 use_instruction_file = False
         if use_instruction_file:
             print(f"INFO: Found {instruction_path}. Using it without editing.")
-            if preloaded_prompt is not None and preloaded_prompt.strip():
-                parsed_caption, parsed_lyrics = _extract_caption_lyrics_from_formatted_prompt(preloaded_prompt)
-                parsed_instruction = _extract_instruction_from_formatted_prompt(preloaded_prompt)
-                parsed_metas = _extract_cot_metadata_from_formatted_prompt(preloaded_prompt)
-                if parsed_caption:
-                    args.caption = parsed_caption
-                if parsed_lyrics:
-                    args.lyrics = parsed_lyrics
-                if parsed_instruction:
-                    args.instruction = parsed_instruction
-                if parsed_metas:
-                    bpm_value = parsed_metas.get("bpm")
-                    if bpm_value:
-                        parsed = _parse_number(bpm_value)
-                        if parsed is not None:
-                            args.bpm = int(parsed)
-                    duration_value = parsed_metas.get("duration")
-                    if duration_value:
-                        parsed = _parse_number(duration_value)
-                        if parsed is not None:
-                            args.duration = float(parsed)
-                    keyscale_value = parsed_metas.get("keyscale")
-                    if keyscale_value:
-                        args.keyscale = keyscale_value
-                    timesignature_value = parsed_metas.get("timesignature")
-                    if timesignature_value:
-                        args.timesignature = timesignature_value
-                    language_value = parsed_metas.get("language") or parsed_metas.get("vocal_language")
-                    if language_value:
-                        args.vocal_language = language_value
-        elif preloaded_prompt is not None and not preloaded_prompt.strip():
+        if preloaded_prompt is not None and not preloaded_prompt.strip():
             preloaded_prompt = None
         _install_prompt_edit_hook(llm_handler, instruction_path, preloaded_prompt=preloaded_prompt)
 
@@ -1724,6 +1737,14 @@ def main():
                         user_metadata["duration"] = int(duration_value)
                 except (ValueError, TypeError):
                     pass
+            # Only include caption and language in user_metadata on
+            # regeneration attempts.  On the first attempt the LM should
+            # generate/expand these via CoT (matching inference.py behaviour).
+            if attempt > 0:
+                if params.caption and params.caption.strip():
+                    user_metadata["caption"] = params.caption.strip()
+                if params.vocal_language and params.vocal_language not in ("", "unknown"):
+                    user_metadata["language"] = params.vocal_language
             user_metadata_to_pass = user_metadata if user_metadata else None
 
             lm_result = llm_handler.generate_with_stop_condition(
@@ -1828,17 +1849,29 @@ def main():
                         params.timesignature = parsed_timesignature
                     if language_changed:
                         params.vocal_language = parsed_language
+                    # Carry forward the expanded caption so the second
+                    # attempt's <think> block (and user_metadata) use it
+                    # instead of the short original caption.
+                    edited_caption_for_regen = edited_metas.get("caption") if edited_metas else None
+                    if edited_caption_for_regen and edited_caption_for_regen.strip():
+                        params.caption = edited_caption_for_regen
                     print("INFO: Edited metadata detected. Regenerating audio codes with updated values.")
                     llm_handler._skip_prompt_edit = True
                     continue
             break
 
-        if edited_caption:
+        edited_meta_caption = edited_metas.get("caption") if edited_metas else None
+        if edited_meta_caption and edited_meta_caption.strip():
+            params.caption = edited_meta_caption
+        elif edited_caption:
             params.caption = edited_caption
         elif params.use_cot_caption and lm_metadata.get("caption"):
             params.caption = lm_metadata.get("caption")
+
         if edited_lyrics:
             params.lyrics = edited_lyrics
+        elif not params.lyrics and lm_metadata.get("lyrics"):
+            params.lyrics = lm_metadata.get("lyrics")
 
         if edited_instruction:
             params.instruction = edited_instruction
@@ -1880,6 +1913,32 @@ def main():
                 language_value = lm_metadata.get("vocal_language") or lm_metadata.get("language")
                 if language_value:
                     params.vocal_language = language_value
+
+        # use_cot_language: override vocal_language with LM detection unless
+        # the user explicitly edited the language in the think block.
+        if params.use_cot_language:
+            edited_lang = (edited_metas.get("language") or edited_metas.get("vocal_language")) if edited_metas else None
+            if not edited_lang:
+                lm_lang = lm_metadata.get("vocal_language") or lm_metadata.get("language")
+                if lm_lang:
+                    params.vocal_language = lm_lang
+
+        # Populate cot_* fields for downstream reporting (mirrors inference.py)
+        if lm_metadata:
+            if original_bpm is None:
+                params.cot_bpm = params.bpm
+            if not original_keyscale:
+                params.cot_keyscale = params.keyscale
+            if not original_timesignature:
+                params.cot_timesignature = params.timesignature
+            if original_target_duration is None or float(original_target_duration) <= 0:
+                params.cot_duration = params.duration
+            if original_vocal_language in (None, "", "unknown"):
+                params.cot_vocal_language = params.vocal_language
+            if not params.caption:
+                params.cot_caption = lm_metadata.get("caption", "")
+            if not params.lyrics:
+                params.cot_lyrics = lm_metadata.get("lyrics", "")
 
         params.thinking = False
         params.use_cot_caption = False

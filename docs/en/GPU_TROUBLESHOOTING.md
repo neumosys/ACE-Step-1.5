@@ -39,9 +39,10 @@ export HSA_OVERRIDE_GFX_VERSION=11.0.2  # For RX 7600
 set HSA_OVERRIDE_GFX_VERSION=11.0.0
 ```
 
-Or use the provided launcher script which sets this automatically:
+Or use the provided launcher scripts which set this automatically:
 ```cmd
 start_gradio_ui_rocm.bat
+start_api_server_rocm.bat
 ```
 
 #### For RDNA2 GPUs (RX 6000 series):
@@ -155,7 +156,7 @@ For NVIDIA GPUs in WSL2, you need CUDA on WSL2:
 
 For AMD GPUs, ROCm support in WSL2 is limited. Consider:
 - Running on native Linux
-- Using Windows with `start_gradio_ui_rocm.bat`
+- Using Windows with `start_gradio_ui_rocm.bat` / `start_api_server_rocm.bat`
 
 ## GPU-Specific Configuration
 
@@ -166,7 +167,7 @@ For AMD GPUs, ROCm support in WSL2 is limited. Consider:
 export HSA_OVERRIDE_GFX_VERSION=11.0.0
 export MIOPEN_FIND_MODE=FAST
 
-# Windows (or use start_gradio_ui_rocm.bat)
+# Windows (or use start_gradio_ui_rocm.bat / start_api_server_rocm.bat)
 set HSA_OVERRIDE_GFX_VERSION=11.0.0
 set MIOPEN_FIND_MODE=FAST
 ```
@@ -228,4 +229,52 @@ If none of the above solutions work:
 
 | Variable | Purpose | Example |
 |----------|---------|---------|
-| `MAX_CUDA_VRAM` | Override detected VRAM (testing) | `8` (simulate 8GB GPU) |
+| `MAX_CUDA_VRAM` | Override detected VRAM for tier simulation (also enforces hard VRAM cap via `set_per_process_memory_fraction`) | `8` (simulate 8GB GPU) |
+| `ACESTEP_VAE_ON_CPU` | Force VAE decode on CPU to save VRAM | `1` (enable) |
+
+> **Note on `MAX_CUDA_VRAM`**: When set, this variable not only changes the tier detection logic but also calls `torch.cuda.set_per_process_memory_fraction()` to enforce a hard VRAM limit. This means OOM errors during simulation are realistic and reflect actual behavior on GPUs with that amount of VRAM. See [GPU_COMPATIBILITY.md](GPU_COMPATIBILITY.md) for the full tier table.
+
+## LoRA Memory Issues (FIXED)
+
+### Issue: High VRAM Usage with LoRA (25-30GB)
+
+**Symptoms:**
+- Cannot use LoRA on 24GB VRAM GPUs (e.g., RTX 4090)
+- VRAM usage spikes to 25-30GB when loading LoRA
+- Out of memory errors during LoRA inference
+
+**Status:** ✅ **FIXED** (as of commit 731fabd)
+
+**Solution:**
+
+This issue was caused by inefficient memory management in the LoRA lifecycle code. The fix replaces memory-heavy `deepcopy` operations with efficient `state_dict` backups stored on CPU.
+
+**Memory Usage:**
+- **Before fix**: 24-33GB VRAM (exceeds 24GB cards)
+- **After fix**: 14-18GB VRAM (fits on 24GB cards)
+- **Savings**: ~10-15GB VRAM per LoRA operation
+
+**What Changed:**
+- LoRA base model backup now stored on CPU (not GPU)
+- Uses `state_dict` (weights only) instead of `deepcopy` (full model)
+- Added memory diagnostics logging
+
+**Verify the Fix:**
+
+Run the validation script to confirm:
+```bash
+python scripts/validate_lora_memory.py
+```
+
+Expected output:
+```
+✓ No deepcopy found in load_lora/unload_lora
+✓ Using state_dict backup (memory-efficient)
+✓ Backing up to CPU (saves VRAM)
+✓ Memory diagnostics enabled
+```
+
+**Additional Information:**
+- Technical details: `docs/lora_memory_optimization.md`
+- Full fix summary: `docs/FIX_SUMMARY.md`
+- Unit tests: `tests/test_lora_lifecycle_memory.py`
