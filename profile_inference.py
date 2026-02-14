@@ -771,6 +771,9 @@ def _run_single_tier_test(
     else:
         use_lm = args.tier_with_lm and gpu_config.init_lm_default and bool(gpu_config.available_lm_models)
 
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        offload_override = False
+
     if offload_override is not None:
         offload = offload_override
     else:

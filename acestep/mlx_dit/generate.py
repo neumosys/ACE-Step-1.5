@@ -8,6 +8,7 @@ import time
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,7 @@ def mlx_generate_diffusion(
     audio_cover_strength: float = 1.0,
     encoder_hidden_states_non_cover_np: Optional[np.ndarray] = None,
     context_latents_non_cover_np: Optional[np.ndarray] = None,
+    disable_tqdm: bool = False,
 ) -> Dict[str, object]:
     """Run the complete MLX diffusion loop.
 
@@ -103,6 +105,7 @@ def mlx_generate_diffusion(
         audio_cover_strength: cover strength (0-1).
         encoder_hidden_states_non_cover_np: optional [B, enc_L, D] for non-cover.
         context_latents_non_cover_np: optional [B, T, C] for non-cover.
+        disable_tqdm: If True, suppress the diffusion progress bar.
 
     Returns:
         Dict with ``"target_latents"`` (numpy) and ``"time_costs"`` dict.
@@ -152,7 +155,7 @@ def mlx_generate_diffusion(
 
     diff_start = time.time()
 
-    for step_idx in range(num_steps):
+    for step_idx in tqdm(range(num_steps), desc="MLX DiT diffusion", disable=disable_tqdm):
         current_t = t_schedule_list[step_idx]
         t_curr = mx.full((bsz,), current_t)
 
@@ -180,23 +183,22 @@ def mlx_generate_diffusion(
             t_unsq = mx.expand_dims(mx.expand_dims(t_curr, axis=-1), axis=-1)
             xt = xt - vt * t_unsq
             mx.eval(xt)
-            break
-
-        # ODE / SDE update
-        next_t = t_schedule_list[step_idx + 1]
-        if infer_method == "sde":
-            t_unsq = mx.expand_dims(mx.expand_dims(t_curr, axis=-1), axis=-1)
-            pred_clean = xt - vt * t_unsq
-            # Re-noise with next timestep
-            new_noise = mx.random.normal(xt.shape)
-            xt = next_t * new_noise + (1.0 - next_t) * pred_clean
         else:
-            # ODE Euler step: x_{t+1} = x_t - v_t * dt
-            dt = current_t - next_t
-            dt_arr = mx.full((bsz, 1, 1), dt)
-            xt = xt - vt * dt_arr
+            # ODE / SDE update
+            next_t = t_schedule_list[step_idx + 1]
+            if infer_method == "sde":
+                t_unsq = mx.expand_dims(mx.expand_dims(t_curr, axis=-1), axis=-1)
+                pred_clean = xt - vt * t_unsq
+                # Re-noise with next timestep
+                new_noise = mx.random.normal(xt.shape)
+                xt = next_t * new_noise + (1.0 - next_t) * pred_clean
+            else:
+                # ODE Euler step: x_{t+1} = x_t - v_t * dt
+                dt = current_t - next_t
+                dt_arr = mx.full((bsz, 1, 1), dt)
+                xt = xt - vt * dt_arr
 
-        mx.eval(xt)
+            mx.eval(xt)
 
     diff_end = time.time()
     total_end = time.time()
