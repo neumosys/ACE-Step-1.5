@@ -146,6 +146,7 @@ class AceStepHandler(
         # MLX DiT acceleration (macOS Apple Silicon only)
         self.mlx_decoder = None
         self.use_mlx_dit = False
+        self.mlx_dit_compiled = False
 
         # MLX VAE acceleration (macOS Apple Silicon only)
         self.mlx_vae = None
@@ -154,8 +155,13 @@ class AceStepHandler(
     # ------------------------------------------------------------------
     # MLX DiT acceleration helpers
     # ------------------------------------------------------------------
-    def _init_mlx_dit(self) -> bool:
+    def _init_mlx_dit(self, compile_model: bool = False) -> bool:
         """Try to initialize the native MLX DiT decoder for Apple Silicon.
+
+        Args:
+            compile_model: If True, the diffusion step will be compiled with
+                ``mx.compile`` for kernel fusion during generation.  The
+                compilation itself happens lazily in ``mlx_generate_diffusion``.
 
         Returns True on success, False on failure (non-fatal).
         """
@@ -172,12 +178,17 @@ class AceStepHandler(
             convert_and_load(self.model, mlx_decoder)
             self.mlx_decoder = mlx_decoder
             self.use_mlx_dit = True
-            logger.info("[MLX-DiT] Native MLX DiT decoder initialized successfully.")
+            self.mlx_dit_compiled = compile_model
+            logger.info(
+                f"[MLX-DiT] Native MLX DiT decoder initialized successfully "
+                f"(mx.compile={compile_model})."
+            )
             return True
         except Exception as exc:
             logger.warning(f"[MLX-DiT] Failed to initialize MLX decoder (non-fatal): {exc}")
             self.mlx_decoder = None
             self.use_mlx_dit = False
+            self.mlx_dit_compiled = False
             return False
 
     # ------------------------------------------------------------------
@@ -525,7 +536,8 @@ class AceStepHandler(
             config_path: Model config directory name (e.g., "acestep-v15-turbo")
             device: Device type
             use_flash_attention: Whether to use flash attention (requires flash_attn package)
-            compile_model: Whether to use torch.compile to optimize the model
+            compile_model: Whether to compile the model. On CUDA/XPU uses
+                torch.compile; on MPS redirects to mx.compile for MLX components.
             offload_to_cpu: Whether to offload models to CPU when not in use
             offload_dit_to_cpu: Whether to offload DiT model to CPU when not in use (only effective if offload_to_cpu is True)
             prefer_source: Preferred download source ("huggingface", "modelscope", or None for auto-detect)
@@ -585,11 +597,19 @@ class AceStepHandler(
             self.offload_to_cpu = offload_to_cpu
             self.offload_dit_to_cpu = offload_dit_to_cpu
             
-            # MPS safety: torch.compile and torchao quantization are not supported on MPS
+            # MPS safety: torch.compile and torchao quantization are not supported
+            # on MPS.  When the user requests compilation on MPS, we redirect the
+            # intent to mx.compile for the MLX components (DiT, VAE) instead of
+            # silently dropping it.
+            mlx_compile_requested = False
             if device == "mps":
                 if compile_model:
-                    logger.warning("[initialize_service] torch.compile is not supported on MPS; disabling.")
-                    compile_model = False
+                    logger.info(
+                        "[initialize_service] MPS detected: torch.compile is not "
+                        "supported — redirecting to mx.compile for MLX components."
+                    )
+                    mlx_compile_requested = True
+                    compile_model = False  # Disable torch.compile (unsupported on MPS)
                 if quantization is not None:
                     logger.warning("[initialize_service] Quantization (torchao) is not supported on MPS; disabling.")
                     quantization = None
@@ -816,19 +836,30 @@ class AceStepHandler(
             # Determine actual attention implementation used
             actual_attn = getattr(self.config, "_attn_implementation", "eager")
 
-            # Try to initialize native MLX DiT for Apple Silicon acceleration
+            # Try to initialize native MLX DiT for Apple Silicon acceleration.
+            # On MPS with compilation requested, mx.compile is used instead of
+            # torch.compile (which is unsupported on MPS).
             mlx_dit_status = "Disabled"
-            if use_mlx_dit and device in ("mps", "cpu") and not compile_model:
-                mlx_ok = self._init_mlx_dit()
-                mlx_dit_status = "Active (native MLX)" if mlx_ok else "Unavailable (PyTorch fallback)"
+            if use_mlx_dit and device in ("mps", "cpu"):
+                mlx_ok = self._init_mlx_dit(compile_model=mlx_compile_requested)
+                if mlx_ok:
+                    mlx_dit_status = (
+                        "Active (native MLX, mx.compile)"
+                        if mlx_compile_requested
+                        else "Active (native MLX)"
+                    )
+                else:
+                    mlx_dit_status = "Unavailable (PyTorch fallback)"
             elif not use_mlx_dit:
                 mlx_dit_status = "Disabled by user"
                 self.mlx_decoder = None
                 self.use_mlx_dit = False
 
-            # Try to initialize native MLX VAE for Apple Silicon acceleration
+            # Try to initialize native MLX VAE for Apple Silicon acceleration.
+            # The MLX VAE applies mx.compile internally regardless of the user's
+            # compile_model setting (it always benefits from kernel fusion).
             mlx_vae_status = "Disabled"
-            if device in ("mps", "cpu") and not compile_model:
+            if device in ("mps", "cpu"):
                 mlx_vae_ok = self._init_mlx_vae()
                 mlx_vae_status = "Active (native MLX)" if mlx_vae_ok else "Unavailable (PyTorch fallback)"
             else:
@@ -841,7 +872,11 @@ class AceStepHandler(
             status_msg += f"Text encoder: {text_encoder_path}\n"
             status_msg += f"Dtype: {self.dtype}\n"
             status_msg += f"Attention: {actual_attn}\n"
-            status_msg += f"Compiled: {compile_model}\n"
+            compiled_label = (
+                "mx.compile (MLX)" if mlx_compile_requested
+                else str(compile_model)
+            )
+            status_msg += f"Compiled: {compiled_label}\n"
             status_msg += f"Offload to CPU: {self.offload_to_cpu}\n"
             status_msg += f"Offload DiT to CPU: {self.offload_dit_to_cpu}\n"
             status_msg += f"MLX DiT: {mlx_dit_status}\n"

@@ -578,8 +578,10 @@ def get_gpu_config(gpu_memory_gb: Optional[float] = None) -> GPUConfig:
         # MPS: unified memory — offloading to CPU is pointless overhead
         offload_to_cpu_default=False if _mps else config.get("offload_to_cpu_default", True),
         offload_dit_to_cpu_default=False if _mps else config.get("offload_dit_to_cpu_default", True),
-        # MPS: torch.compile and torchao quantization are not supported
+        # MPS: torchao quantization is not supported
         quantization_default=False if _mps else config.get("quantization_default", True),
+        # MPS: torch.compile unsupported (redirected to mx.compile at runtime);
+        # default to False — user can opt in via the UI checkbox.
         compile_model_default=False if _mps else config.get("compile_model_default", True),
         lm_memory_gb=config["lm_memory_gb"],
     )
