@@ -11,6 +11,7 @@ import types
 import unittest
 from pathlib import Path
 from typing import Any, Dict
+from unittest.mock import patch
 
 import torch
 
@@ -63,12 +64,15 @@ class _Host(GenerateMusicMixin):
     payloads so tests can assert orchestration sequencing and return behavior.
     """
 
-    def __init__(self):
+    def __init__(self, offload_to_cpu: bool = False, is_turbo: bool = False):
         """Initialize deterministic state and stub payloads for orchestration tests."""
         self.model = object()
         self.vae = object()
         self.text_tokenizer = object()
         self.text_encoder = object()
+        self.offload_to_cpu = offload_to_cpu
+        self._is_turbo = is_turbo
+        self.sample_rate = 48000
         self.calls: Dict[str, Any] = {}
         self._final_payload = {"audios": [{"tensor": torch.zeros(1, 4), "sample_rate": 48000}], "success": True}
         self._readiness_error = {
@@ -78,6 +82,10 @@ class _Host(GenerateMusicMixin):
             "success": False,
             "error": "Model not fully initialized",
         }
+
+    def is_turbo_model(self):
+        """Return whether this host simulates a turbo model."""
+        return self._is_turbo
 
     def _resolve_generate_music_progress(self, progress):
         """Return provided callback or deterministic no-op callback."""
@@ -148,6 +156,9 @@ class _Host(GenerateMusicMixin):
         self.calls["_build_generate_music_success_payload"] = kwargs
         return self._final_payload
 
+    def _empty_cache(self):
+        """No-op cache clear for test host."""
+
 
 class GenerateMusicMixinTests(unittest.TestCase):
     """Verify top-level ``generate_music`` orchestration behavior."""
@@ -191,6 +202,110 @@ class GenerateMusicMixinTests(unittest.TestCase):
         self.assertFalse(out["success"])
         self.assertEqual(out["error"], "boom")
         self.assertIn("Error: boom", out["status_message"])
+
+
+class VramPreflightCheckTests(unittest.TestCase):
+    """Verify ``_vram_preflight_check`` respects CPU offload mode."""
+
+    _GM_MOD = GENERATE_MUSIC_MODULE
+
+    @patch.object(_GM_MOD, "torch")
+    def test_preflight_skips_when_offload_to_cpu_enabled(self, mock_torch):
+        """It returns None (pass) when offload_to_cpu is True, regardless of free VRAM."""
+        mock_torch.cuda.is_available.return_value = True
+        host = _Host(offload_to_cpu=True)
+        result = host._vram_preflight_check(
+            actual_batch_size=2,
+            audio_duration=246.0,
+            guidance_scale=7.0,
+        )
+        self.assertIsNone(result)
+
+    @patch.object(_GM_MOD, "get_effective_free_vram_gb", return_value=3.4)
+    @patch.object(_GM_MOD, "torch")
+    def test_preflight_blocks_when_offload_disabled_and_vram_low(
+        self, mock_torch, _mock_free_vram
+    ):
+        """It returns error payload when offload is off and free VRAM is insufficient."""
+        mock_torch.cuda.is_available.return_value = True
+        host = _Host(offload_to_cpu=False)
+        result = host._vram_preflight_check(
+            actual_batch_size=2,
+            audio_duration=246.0,
+            guidance_scale=7.0,
+        )
+        self.assertIsNotNone(result)
+        self.assertFalse(result["success"])
+        self.assertIn("Insufficient free VRAM", result["error"])
+
+    @patch.object(_GM_MOD, "get_effective_free_vram_gb", return_value=24.0)
+    @patch.object(_GM_MOD, "torch")
+    def test_preflight_passes_when_offload_disabled_and_vram_sufficient(
+        self, mock_torch, _mock_free_vram
+    ):
+        """It returns None when offload is off but free VRAM exceeds estimate."""
+        mock_torch.cuda.is_available.return_value = True
+        host = _Host(offload_to_cpu=False)
+        result = host._vram_preflight_check(
+            actual_batch_size=2,
+            audio_duration=246.0,
+            guidance_scale=7.0,
+        )
+        self.assertIsNone(result)
+
+    @patch.object(_GM_MOD, "torch")
+    def test_preflight_passes_on_non_cuda_device(self, mock_torch):
+        """It returns None when CUDA is not available (CPU/MPS/XPU)."""
+        mock_torch.cuda.is_available.return_value = False
+        host = _Host(offload_to_cpu=False)
+        result = host._vram_preflight_check(
+            actual_batch_size=2,
+            audio_duration=246.0,
+            guidance_scale=7.0,
+        )
+        self.assertIsNone(result)
+
+
+class TurboGuidanceScaleTests(unittest.TestCase):
+    """Verify turbo models force guidance_scale to 1.0 (issue #927)."""
+
+    def test_turbo_model_overrides_guidance_scale_to_one(self):
+        """Turbo model should clamp guidance_scale to 1.0 before service call."""
+        host = _Host(is_turbo=True)
+        host._readiness_error = None
+        out = host.generate_music(
+            captions="cap",
+            lyrics="lyr",
+            inference_steps=8,
+            guidance_scale=7.0,
+            use_random_seed=False,
+            seed=77,
+            task_type="text2music",
+        )
+        self.assertEqual(out, host._final_payload)
+        self.assertEqual(
+            host.calls["_run_generate_music_service_with_progress"]["guidance_scale"],
+            1.0,
+        )
+
+    def test_non_turbo_model_preserves_guidance_scale(self):
+        """Non-turbo model should keep the user-provided guidance_scale."""
+        host = _Host(is_turbo=False)
+        host._readiness_error = None
+        out = host.generate_music(
+            captions="cap",
+            lyrics="lyr",
+            inference_steps=8,
+            guidance_scale=7.0,
+            use_random_seed=False,
+            seed=77,
+            task_type="text2music",
+        )
+        self.assertEqual(out, host._final_payload)
+        self.assertEqual(
+            host.calls["_run_generate_music_service_with_progress"]["guidance_scale"],
+            7.0,
+        )
 
 
 if __name__ == "__main__":
