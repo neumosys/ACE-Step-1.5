@@ -92,11 +92,17 @@ RUN mkdir -p /app/outputs /app/checkpoints /app/logs && \
     chown -R appuser:appuser /app/outputs /app/checkpoints /app/logs
 
 # Pre-download models during build (baked into image for fast startup)
-# Download main model (includes turbo DiT, VAE, text encoder, LLM 1.7B)
+# Shared assets bundle (VAE, text encoder, schedulers, etc.)
 RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/Ace-Step1.5', local_dir='/app/checkpoints')"
 
-# Download base DiT model (for extract, lego, complete tasks)
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/acestep-v15-base', local_dir='/app/checkpoints/acestep-v15-base')"
+# 4B XL turbo DiT (for text2music, cover, repaint)
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/acestep-v15-xl-turbo', local_dir='/app/checkpoints/acestep-v15-xl-turbo')"
+
+# 4B XL base DiT (for extract, lego, complete)
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/acestep-v15-xl-base', local_dir='/app/checkpoints/acestep-v15-xl-base')"
+
+# 4B 5Hz Language Model (planner / chain-of-thought)
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/acestep-5Hz-lm-4B', local_dir='/app/checkpoints/acestep-5Hz-lm-4B')"
 
 # Change ownership
 RUN chown -R appuser:appuser /app
@@ -111,10 +117,12 @@ EXPOSE 8000
 VOLUME [ "/app/outputs", "/app/logs" ]
 
 # Default environment variables (can be overridden at runtime)
+# All-XL configuration: 4B DiT for every task + 4B LM planner
+# Targets L40S 48GB (or any 40GB+ GPU). For 24GB GPUs, set LM_MODEL=acestep-5Hz-lm-1.7B
 ENV CHECKPOINT_DIR=/app/checkpoints \
-    DIT_MODEL_TURBO=acestep-v15-turbo \
-    DIT_MODEL_BASE=acestep-v15-base \
-    LM_MODEL=acestep-5Hz-lm-1.7B \
+    DIT_MODEL_TURBO=acestep-v15-xl-turbo \
+    DIT_MODEL_BASE=acestep-v15-xl-base \
+    LM_MODEL=acestep-5Hz-lm-4B \
     LM_BACKEND=vllm \
     DEVICE=cuda \
     USE_FLASH_ATTENTION=true \
