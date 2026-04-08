@@ -91,32 +91,57 @@ RUN pip install --no-cache-dir -e .
 RUN mkdir -p /app/outputs /app/checkpoints /app/logs && \
     chown -R appuser:appuser /app/outputs /app/checkpoints /app/logs
 
-# Models are NOT baked into the image (would be ~35GB and exceed Runpod's
-# 30-min build timeout). Instead they are downloaded lazily on first cold
-# start to a Runpod network volume mounted at /runpod-volume, where they
-# persist across all future workers. See README_RUNPOD_DEPLOY.md.
+# Pre-download the HOT-PATH models into the image.
+#
+# Why partial bake: the full all-XL set is ~29 GB which cuts it close to
+# Runpod's hard 30-min managed-build timeout. Baking only the models used
+# on every request keeps the build comfortably under ~22 GB of downloads
+# and frees the build to finish in ~15-20 min. The "cold path" model
+# (acestep-v15-xl-base, used only by extract/lego/complete tasks) is
+# auto-downloaded into /app/checkpoints by init_service_downloads.py on
+# the first request that needs it - a ~3-5 min one-time penalty per
+# fresh worker, paid only by v2s requests (not by song gen or remix).
+#
+# We baked, not network-volumed, so the endpoint is not pinned to one
+# region and you can burst across GPU pools.
+#
+# All three downloads run in parallel inside one RUN layer. hf_transfer
+# saturates bandwidth for each; parallelism squeezes a few extra minutes
+# off the total.
+RUN python -c "\
+import concurrent.futures as cf; \
+from huggingface_hub import snapshot_download; \
+jobs = [ \
+    ('ACE-Step/Ace-Step1.5', '/app/checkpoints'), \
+    ('ACE-Step/acestep-v15-xl-turbo', '/app/checkpoints/acestep-v15-xl-turbo'), \
+    ('ACE-Step/acestep-5Hz-lm-4B', '/app/checkpoints/acestep-5Hz-lm-4B'), \
+]; \
+ex = cf.ThreadPoolExecutor(max_workers=3); \
+futs = [ex.submit(snapshot_download, repo_id=r, local_dir=d) for r, d in jobs]; \
+[f.result() for f in futs] \
+"
 
 # Change ownership of app dir
 RUN chown -R appuser:appuser /app
 
-# Stay as root so the handler can write to /runpod-volume regardless of how
-# Runpod mounts the network volume. (Runpod serverless workers are isolated;
-# non-root inside the container provides little additional safety.)
+# Stay as root so the handler can write to /app/checkpoints for the
+# lazy xl-base download on first v2s request. Runpod serverless workers
+# are already isolated; non-root inside the container adds little.
 
 # Expose port (for documentation)
 EXPOSE 8000
 
-# Volumes for outputs and logs (checkpoints live on the Runpod network volume)
+# Volumes for outputs and logs only (checkpoints baked in + lazy xl-base)
 VOLUME [ "/app/outputs", "/app/logs" ]
 
 # Default environment variables (can be overridden at runtime)
 # All-XL configuration: 4B DiT for every task + 4B LM planner.
 # Targets L40S 48GB (or any 40GB+ GPU). For 24GB GPUs, set LM_MODEL=acestep-5Hz-lm-1.7B
 #
-# CHECKPOINT_DIR points at the Runpod network volume mount path. On first
-# cold start the AceStep model loader downloads any missing checkpoints
-# from Hugging Face into this directory. Subsequent starts read from disk.
-ENV CHECKPOINT_DIR=/runpod-volume/checkpoints \
+# CHECKPOINT_DIR is the container-local /app/checkpoints (NOT a network
+# volume). Hot models (xl-turbo, 4B LM, shared VAE/text encoder) are
+# baked into this directory. xl-base auto-downloads here on first use.
+ENV CHECKPOINT_DIR=/app/checkpoints \
     DIT_MODEL_TURBO=acestep-v15-xl-turbo \
     DIT_MODEL_BASE=acestep-v15-xl-base \
     LM_MODEL=acestep-5Hz-lm-4B \
