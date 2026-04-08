@@ -106,6 +106,22 @@ current_dit_model = DIT_MODEL_TURBO
 # Initialize LLM handler (optional - can be disabled for faster startup)
 ENABLE_LLM = os.environ.get("ENABLE_LLM", "true").lower() == "true"
 if ENABLE_LLM:
+    # The LM handler does not auto-download (unlike the DiT loader), so we
+    # explicitly ensure the LM checkpoint is on disk before initializing it.
+    # On a Runpod network volume this download happens once and persists.
+    from acestep.model_downloader import ensure_lm_model
+    print(f"Ensuring LM model present: {LM_MODEL}")
+    lm_dl_success, lm_dl_msg = ensure_lm_model(
+        model_name=LM_MODEL,
+        checkpoints_dir=CHECKPOINT_DIR,
+        prefer_source="huggingface",
+    )
+    print(f"LM download check: {lm_dl_msg}")
+    if not lm_dl_success:
+        print(f"WARNING: LM download failed ({lm_dl_msg}); running in DiT-only mode")
+        ENABLE_LLM = False
+
+if ENABLE_LLM:
     print(f"Initializing LLM: {LM_MODEL} with backend: {LM_BACKEND}")
     lm_status, lm_success = llm_handler.initialize(
         checkpoint_dir=CHECKPOINT_DIR,
