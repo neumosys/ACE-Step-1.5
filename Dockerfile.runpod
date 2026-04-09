@@ -87,9 +87,10 @@ RUN pip install --no-cache-dir "torchcodec>=0.9.1" || echo "torchcodec installat
 # Install the package itself
 RUN pip install --no-cache-dir -e .
 
-# Create directories
-RUN mkdir -p /app/outputs /app/checkpoints /app/logs && \
-    chown -R appuser:appuser /app/outputs /app/checkpoints /app/logs
+# Create directories. No chown here: we removed the non-root `USER appuser`
+# switch below, so everything runs as root and ownership doesn't matter.
+# Keeping a chown would be harmless on empty dirs but is dead code.
+RUN mkdir -p /app/outputs /app/checkpoints /app/logs
 
 # Pre-download ALL models into the image so the endpoint has zero
 # runtime HF dependency and can burst across any Runpod region without
@@ -120,12 +121,12 @@ RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(
 # 4/4: 4B 5Hz LM (planner / chain-of-thought) ~8 GB
 RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/acestep-5Hz-lm-4B', local_dir='/app/checkpoints/acestep-5Hz-lm-4B')"
 
-# Change ownership of app dir
-RUN chown -R appuser:appuser /app
-
-# Stay as root. Runpod serverless workers are already isolated; non-root
-# inside the container adds little, and the baked checkpoints are owned
-# by root anyway from the download step above.
+# DO NOT add `RUN chown -R appuser:appuser /app` here. chown -R on a
+# directory containing ~40 GB of model files causes Docker to duplicate
+# every file into a new layer (OverlayFS COW on metadata change), which
+# blew the Runpod 30-min build timeout on the export/tarball-send phase.
+# The handler runs as root (non-root USER directive removed below) so
+# ownership is already correct.
 
 # Expose port (for documentation)
 EXPOSE 8000
