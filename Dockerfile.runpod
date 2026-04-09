@@ -123,12 +123,13 @@ RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(
 # 4/4: 4B 5Hz LM (planner / chain-of-thought) ~8 GB
 RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/acestep-5Hz-lm-4B', local_dir='/app/checkpoints/acestep-5Hz-lm-4B')"
 
-# DO NOT add `RUN chown -R appuser:appuser /app` here. chown -R on a
-# directory containing ~40 GB of model files causes Docker to duplicate
-# every file into a new layer (OverlayFS COW on metadata change), which
-# blew the Runpod 30-min build timeout on the export/tarball-send phase.
-# The handler runs as root (non-root USER directive removed below) so
-# ownership is already correct.
+# Satisfy the runtime's check_main_model_exists() which requires
+# "acestep-v15-turbo" and "acestep-5Hz-lm-1.7B" to contain weights.
+# We don't bake those old models — symlink to the XL variants instead.
+# The checker sees model.safetensors.index.json (xl-turbo) and
+# model.safetensors (lm-4B) via the symlinks and skips the download.
+RUN ln -s /app/checkpoints/acestep-v15-xl-turbo /app/checkpoints/acestep-v15-turbo && \
+    ln -s /app/checkpoints/acestep-5Hz-lm-4B /app/checkpoints/acestep-5Hz-lm-1.7B
 
 # Expose port (for documentation)
 EXPOSE 8000
@@ -140,10 +141,11 @@ VOLUME [ "/app/outputs", "/app/logs" ]
 # All-XL configuration: 4B DiT for every task + 4B LM planner.
 # Targets L40S 48GB (or any 40GB+ GPU). For 24GB GPUs, set LM_MODEL=acestep-5Hz-lm-1.7B
 #
-# CHECKPOINT_DIR is the container-local /app/checkpoints (NOT a network
-# volume). All models (xl-turbo, xl-base, 4B LM, shared bundle) are
-# baked into this directory at build time.
-ENV CHECKPOINT_DIR=/app/checkpoints \
+# ACESTEP_CHECKPOINTS_DIR tells the model resolver exactly where to look,
+# bypassing the project_root + "/checkpoints" double-nesting bug in
+# init_service_orchestrator.py:122. CHECKPOINT_DIR is kept for the handler.
+ENV ACESTEP_CHECKPOINTS_DIR=/app/checkpoints \
+    CHECKPOINT_DIR=/app/checkpoints \
     DIT_MODEL_TURBO=acestep-v15-xl-turbo \
     DIT_MODEL_BASE=acestep-v15-xl-base \
     LM_MODEL=acestep-5Hz-lm-4B \
