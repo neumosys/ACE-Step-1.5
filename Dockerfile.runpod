@@ -95,35 +95,30 @@ RUN mkdir -p /app/outputs /app/checkpoints /app/logs && \
 # runtime HF dependency and can burst across any Runpod region without
 # a network volume.
 #
-# Total download during build is ~29-32 GB which is close to Runpod's
-# hard 30-min managed-build timeout. Mitigations:
-#   1. All four downloads run in parallel in a SINGLE RUN layer - HF
-#      serves each stream independently, so wall-clock scales with the
-#      slowest stream rather than the sum. On hf_transfer that's
-#      typically 8-12 min for the biggest model.
-#   2. We rely on HF_HUB_ENABLE_HF_TRANSFER=1 (set in the base ENV) to
-#      use the Rust-based hf_transfer backend which maxes out bandwidth.
-#   3. The ThreadPoolExecutor bubbles up exceptions so the build fails
-#      fast if any single download dies, instead of burning 29 min on
-#      the other three before reporting.
+# CRITICAL DESIGN NOTE: each model is downloaded in its OWN `RUN` layer.
+# A previous iteration used a single parallel-download RUN, which made
+# the HF downloads themselves fast (~45s with hf_transfer) but produced
+# one ~40 GB image layer. BuildKit then spent ~47 min exporting that
+# single layer and another ~20 min sending the tarball, blowing through
+# Runpod's 30-min build timeout. Splitting into multiple smaller layers
+# lets BuildKit parallelize extract/export/transmit across layers, and
+# also means a failed retry only re-pulls the layers that changed.
 #
-# If Runpod's build network is too slow and this still times out, the
-# fallback is to drop acestep-v15-xl-base from the list and let the
-# acestep init_service_downloads mixin lazy-download it on first v2s
-# request.
-RUN python -c "\
-import concurrent.futures as cf; \
-from huggingface_hub import snapshot_download; \
-jobs = [ \
-    ('ACE-Step/Ace-Step1.5', '/app/checkpoints'), \
-    ('ACE-Step/acestep-v15-xl-turbo', '/app/checkpoints/acestep-v15-xl-turbo'), \
-    ('ACE-Step/acestep-v15-xl-base', '/app/checkpoints/acestep-v15-xl-base'), \
-    ('ACE-Step/acestep-5Hz-lm-4B', '/app/checkpoints/acestep-5Hz-lm-4B'), \
-]; \
-ex = cf.ThreadPoolExecutor(max_workers=4); \
-futs = [ex.submit(snapshot_download, repo_id=r, local_dir=d) for r, d in jobs]; \
-[f.result() for f in futs] \
-"
+# hf_transfer (HF_HUB_ENABLE_HF_TRANSFER=1, set in the base ENV) still
+# handles each individual download at full bandwidth - we lose the
+# cross-model parallelism but that was never the bottleneck.
+
+# 1/4: Shared bundle (VAE, text encoder, schedulers, etc.) ~3-5 GB
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/Ace-Step1.5', local_dir='/app/checkpoints')"
+
+# 2/4: 4B XL turbo DiT (text2music, cover, repaint) ~9 GB
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/acestep-v15-xl-turbo', local_dir='/app/checkpoints/acestep-v15-xl-turbo')"
+
+# 3/4: 4B XL base DiT (extract, lego, complete) ~9 GB
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/acestep-v15-xl-base', local_dir='/app/checkpoints/acestep-v15-xl-base')"
+
+# 4/4: 4B 5Hz LM (planner / chain-of-thought) ~8 GB
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/acestep-5Hz-lm-4B', local_dir='/app/checkpoints/acestep-5Hz-lm-4B')"
 
 # Change ownership of app dir
 RUN chown -R appuser:appuser /app
