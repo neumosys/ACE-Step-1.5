@@ -2120,6 +2120,269 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
         }
 
 
+    def flowedit_audio(
+        self,
+        text_hidden_states: torch.FloatTensor,
+        text_attention_mask: torch.FloatTensor,
+        lyric_hidden_states: torch.FloatTensor,
+        lyric_attention_mask: torch.FloatTensor,
+        refer_audio_acoustic_hidden_states_packed: torch.FloatTensor,
+        refer_audio_order_mask: torch.LongTensor,
+        src_latents: torch.FloatTensor,
+        chunk_masks: torch.FloatTensor,
+        is_covers: torch.Tensor,
+        # Target conditioning (new lyrics/caption)
+        target_text_hidden_states: torch.FloatTensor = None,
+        target_text_attention_mask: torch.FloatTensor = None,
+        target_lyric_hidden_states: torch.FloatTensor = None,
+        target_lyric_attention_mask: torch.FloatTensor = None,
+        # FlowEdit params
+        edit_n_min: float = 0.6,
+        edit_n_max: float = 1.0,
+        edit_n_avg: int = 1,
+        # Standard params
+        silence_latent: Optional[torch.FloatTensor] = None,
+        attention_mask: torch.Tensor = None,
+        seed: int = None,
+        shift: float = 3.0,
+        timesteps: Optional[torch.Tensor] = None,
+        precomputed_lm_hints_25Hz: Optional[torch.FloatTensor] = None,
+        audio_codes: Optional[torch.FloatTensor] = None,
+        repaint_mask: Optional[torch.Tensor] = None,
+        clean_src_latents: Optional[torch.FloatTensor] = None,
+        repaint_crossfade_frames: int = 10,
+        repaint_injection_ratio: float = 0.5,
+        **kwargs,
+    ):
+        """FlowEdit diffusion process for lyrics/style editing.
+
+        Runs the DiT twice per step — once with source conditioning (original
+        lyrics/caption), once with target conditioning (new lyrics/caption) —
+        and applies the velocity-field difference to steer the edit while
+        preserving melody and instrumentation.
+
+        When ``repaint_mask`` is provided, FlowEdit only affects the masked
+        region; unmasked regions are forced back to the source at each step.
+
+        Args:
+            text/lyric_hidden_states: Source (original) conditioning.
+            target_text/lyric_hidden_states: Target (new) conditioning.
+            edit_n_min: Start ratio — skip first N% of steps (preserve structure).
+                        Default 0.6 = lyrics-only editing.
+            edit_n_max: End ratio — switch to regular target-only denoising.
+                        Default 1.0.
+            edit_n_avg: Number of noise-sample averaging iterations per step.
+        """
+        # --- Timestep schedule (reuse generate_audio's logic) ---
+        VALID_SHIFTS = [1.0, 2.0, 3.0]
+        SHIFT_TIMESTEPS = {
+            1.0: [1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125],
+            2.0: [1.0, 0.9333333333333333, 0.8571428571428571, 0.7692307692307693,
+                  0.6666666666666666, 0.5454545454545454, 0.4, 0.2222222222222222],
+            3.0: [1.0, 0.9545454545454546, 0.9, 0.8333333333333334, 0.75,
+                  0.6428571428571429, 0.5, 0.3],
+        }
+
+        if timesteps is not None:
+            t_schedule_list = timesteps.tolist() if isinstance(timesteps, torch.Tensor) else list(timesteps)
+            while t_schedule_list and t_schedule_list[-1] == 0:
+                t_schedule_list.pop()
+        else:
+            shift = min(VALID_SHIFTS, key=lambda x: abs(x - shift))
+            t_schedule_list = SHIFT_TIMESTEPS[shift]
+
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                src_latents.shape[0], src_latents.shape[1],
+                device=src_latents.device, dtype=src_latents.dtype,
+            )
+
+        time_costs = {}
+        start_time = time.time()
+        total_start_time = start_time
+
+        # --- Prepare source conditioning ---
+        src_enc_hs, src_enc_mask, src_ctx = self.prepare_condition(
+            text_hidden_states=text_hidden_states,
+            text_attention_mask=text_attention_mask,
+            lyric_hidden_states=lyric_hidden_states,
+            lyric_attention_mask=lyric_attention_mask,
+            refer_audio_acoustic_hidden_states_packed=refer_audio_acoustic_hidden_states_packed,
+            refer_audio_order_mask=refer_audio_order_mask,
+            hidden_states=src_latents,
+            attention_mask=attention_mask,
+            silence_latent=silence_latent,
+            src_latents=src_latents,
+            chunk_masks=chunk_masks,
+            is_covers=is_covers,
+            precomputed_lm_hints_25Hz=precomputed_lm_hints_25Hz,
+            audio_codes=audio_codes,
+        )
+
+        # --- Prepare target conditioning ---
+        tar_enc_hs, tar_enc_mask, tar_ctx = self.prepare_condition(
+            text_hidden_states=target_text_hidden_states,
+            text_attention_mask=target_text_attention_mask,
+            lyric_hidden_states=target_lyric_hidden_states,
+            lyric_attention_mask=target_lyric_attention_mask,
+            refer_audio_acoustic_hidden_states_packed=refer_audio_acoustic_hidden_states_packed,
+            refer_audio_order_mask=refer_audio_order_mask,
+            hidden_states=src_latents,
+            attention_mask=attention_mask,
+            silence_latent=silence_latent,
+            src_latents=src_latents,
+            chunk_masks=chunk_masks,
+            is_covers=is_covers,
+            precomputed_lm_hints_25Hz=precomputed_lm_hints_25Hz,
+            audio_codes=audio_codes,
+        )
+
+        end_time = time.time()
+        time_costs["encoder_time_cost"] = end_time - start_time
+        start_time = end_time
+
+        # --- Initialize ---
+        noise = self.prepare_noise(src_ctx, seed)
+        bsz = src_ctx.shape[0]
+        device = src_ctx.device
+        dtype = src_ctx.dtype
+
+        t_schedule = torch.tensor(t_schedule_list, device=device, dtype=dtype)
+        num_steps = len(t_schedule)
+
+        # x_src = source latents (encoded from the original audio)
+        # For repaint tasks, clean_src_latents holds the VAE-encoded source.
+        # For non-repaint, src_latents from context preparation are used.
+        x_src = clean_src_latents if clean_src_latents is not None else src_latents
+        zt_edit = x_src.clone()
+        xt_tar = None
+
+        step_n_min = int(num_steps * edit_n_min)
+        step_n_max = int(num_steps * edit_n_max)
+        injection_cutoff = round(repaint_injection_ratio * num_steps)
+
+        logger.info(
+            f"[flowedit_audio] Starting FlowEdit: {num_steps} steps, "
+            f"n_min={step_n_min}, n_max={step_n_max}, n_avg={edit_n_avg}"
+        )
+
+        # --- FlowEdit diffusion loop ---
+        for step_idx in range(num_steps):
+            current_t = t_schedule[step_idx].item()
+            next_t = t_schedule[step_idx + 1].item() if step_idx + 1 < num_steps else 0.0
+            dt = current_t - next_t  # positive (stepping from noise → clean)
+
+            if step_idx < step_n_min:
+                continue  # preserve source structure
+
+            t_tensor = current_t * torch.ones((bsz,), device=device, dtype=dtype)
+
+            if step_idx < step_n_max:
+                # --- FlowEdit phase: dual velocity field ---
+                V_delta_avg = torch.zeros_like(x_src)
+
+                for _k in range(edit_n_avg):
+                    fwd_noise = torch.randn_like(x_src)
+
+                    # Construct noised source and target states
+                    zt_src = (1.0 - current_t) * x_src + current_t * fwd_noise
+                    zt_tar_k = zt_edit + zt_src - x_src
+
+                    # Source velocity (no KV cache — different inputs each iter)
+                    with torch.no_grad():
+                        src_kv = EncoderDecoderCache(DynamicCache(), DynamicCache())
+                        Vt_src = self.decoder(
+                            hidden_states=zt_src,
+                            timestep=t_tensor,
+                            timestep_r=t_tensor,
+                            attention_mask=attention_mask,
+                            encoder_hidden_states=src_enc_hs,
+                            encoder_attention_mask=src_enc_mask,
+                            context_latents=src_ctx,
+                            use_cache=False,
+                            past_key_values=src_kv,
+                        )[0]
+
+                    # Target velocity
+                    with torch.no_grad():
+                        tar_kv = EncoderDecoderCache(DynamicCache(), DynamicCache())
+                        Vt_tar = self.decoder(
+                            hidden_states=zt_tar_k,
+                            timestep=t_tensor,
+                            timestep_r=t_tensor,
+                            attention_mask=attention_mask,
+                            encoder_hidden_states=tar_enc_hs,
+                            encoder_attention_mask=tar_enc_mask,
+                            context_latents=tar_ctx,
+                            use_cache=False,
+                            past_key_values=tar_kv,
+                        )[0]
+
+                    V_delta_avg += (1.0 / edit_n_avg) * (Vt_tar - Vt_src)
+
+                # ODE step with the velocity delta
+                dt_tensor = dt * torch.ones((bsz,), device=device, dtype=dtype).unsqueeze(-1).unsqueeze(-1)
+                zt_edit = zt_edit - dt_tensor * V_delta_avg
+
+            else:
+                # --- Regular denoising phase with target conditioning ---
+                if step_idx == step_n_max:
+                    fwd_noise = torch.randn_like(x_src)
+                    zt_src = (1.0 - current_t) * x_src + current_t * fwd_noise
+                    xt_tar = zt_edit + zt_src - x_src
+
+                with torch.no_grad():
+                    tar_kv = EncoderDecoderCache(DynamicCache(), DynamicCache())
+                    Vt_tar = self.decoder(
+                        hidden_states=xt_tar,
+                        timestep=t_tensor,
+                        timestep_r=t_tensor,
+                        attention_mask=attention_mask,
+                        encoder_hidden_states=tar_enc_hs,
+                        encoder_attention_mask=tar_enc_mask,
+                        context_latents=tar_ctx,
+                        use_cache=False,
+                        past_key_values=tar_kv,
+                    )[0]
+
+                dt_tensor = dt * torch.ones((bsz,), device=device, dtype=dtype).unsqueeze(-1).unsqueeze(-1)
+
+                # Final step: compute x0 directly
+                if step_idx == num_steps - 1:
+                    xt_tar = self.get_x0_from_noise(xt_tar, Vt_tar, t_tensor)
+                else:
+                    xt_tar = xt_tar - Vt_tar * dt_tensor
+
+            # Region masking: force non-edit regions back to source
+            current_edit = zt_edit if xt_tar is None else xt_tar
+            if repaint_mask is not None and clean_src_latents is not None and step_idx < injection_cutoff:
+                current_edit = _repaint_step_injection(
+                    current_edit, clean_src_latents, repaint_mask, next_t, noise,
+                )
+                if xt_tar is not None:
+                    xt_tar = current_edit
+                else:
+                    zt_edit = current_edit
+
+        # --- Finalize ---
+        x_gen = zt_edit if xt_tar is None else xt_tar
+
+        if repaint_mask is not None and clean_src_latents is not None and repaint_crossfade_frames > 0:
+            x_gen = _repaint_boundary_blend(
+                x_gen, clean_src_latents, repaint_mask, repaint_crossfade_frames,
+            )
+
+        end_time = time.time()
+        time_costs["diffusion_time_cost"] = end_time - start_time
+        time_costs["diffusion_per_step_time_cost"] = time_costs["diffusion_time_cost"] / max(num_steps, 1)
+        time_costs["total_time_cost"] = end_time - total_start_time
+
+        return {
+            "target_latents": x_gen,
+            "time_costs": time_costs,
+        }
+
+
 def test_forward(model, seed=42):
     # Fix random seed for reproducibility
     import random

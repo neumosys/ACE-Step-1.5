@@ -50,6 +50,11 @@ class ServiceGenerateMixin:
         sampler_mode: str = "euler",
         velocity_norm_threshold: float = 0.0,
         velocity_ema_factor: float = 0.0,
+        edit_target_lyrics: str = "",
+        edit_target_caption: str = "",
+        edit_n_min: float = 0.6,
+        edit_n_max: float = 1.0,
+        edit_n_avg: int = 1,
     ) -> Dict[str, Any]:
         """Generate music latents and metadata from text/audio conditioning inputs.
 
@@ -143,6 +148,11 @@ class ServiceGenerateMixin:
             sampler_mode=sampler_mode,
             velocity_norm_threshold=velocity_norm_threshold,
             velocity_ema_factor=velocity_ema_factor,
+            edit_target_lyrics=edit_target_lyrics,
+            edit_target_caption=edit_target_caption,
+            edit_n_min=edit_n_min,
+            edit_n_max=edit_n_max,
+            edit_n_avg=edit_n_avg,
         )
         outputs, encoder_hidden_states, encoder_attention_mask, context_latents = (
             self._execute_service_generate_diffusion(

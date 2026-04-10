@@ -218,6 +218,11 @@ class GenerateMusicMixin:
         repaint_wav_crossfade_sec: float = 0.0,
         repaint_mode: str = "balanced",
         repaint_strength: float = 0.5,
+        edit_target_lyrics: str = "",
+        edit_target_caption: str = "",
+        edit_n_min: float = 0.6,
+        edit_n_max: float = 1.0,
+        edit_n_avg: int = 1,
         progress=None,
     ) -> Dict[str, Any]:
         """Generate audio from text/reference inputs and return response payload.
@@ -306,7 +311,7 @@ class GenerateMusicMixin:
 
             # Cover/repaint/lego/extract: lock duration to source audio.
             if processed_src_audio is not None and task_type in (
-                "cover", "repaint", "lego", "extract",
+                "cover", "repaint", "lego", "extract", "edit",
             ):
                 audio_duration = processed_src_audio.shape[-1] / self.sample_rate
 
@@ -360,6 +365,11 @@ class GenerateMusicMixin:
                 sampler_mode=sampler_mode,
                 velocity_norm_threshold=velocity_norm_threshold,
                 velocity_ema_factor=velocity_ema_factor,
+                edit_target_lyrics=edit_target_lyrics,
+                edit_target_caption=edit_target_caption,
+                edit_n_min=edit_n_min,
+                edit_n_max=edit_n_max,
+                edit_n_avg=edit_n_avg,
                 repaint_crossfade_frames=resolved_cf_frames,
                 repaint_injection_ratio=injection_ratio,
             )

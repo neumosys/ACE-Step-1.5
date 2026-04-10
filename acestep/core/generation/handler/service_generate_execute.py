@@ -61,6 +61,74 @@ class ServiceGenerateExecuteMixin:
             return seed_list
         return random.randint(0, 2**32 - 1)
 
+    def _prepare_flowedit_target_conditioning(
+        self,
+        target_caption: str,
+        target_lyrics: str,
+        source_text_hidden_states: torch.Tensor,
+        source_text_attention_mask: torch.Tensor,
+        source_lyric_hidden_states: torch.Tensor,
+        source_lyric_attention_mask: torch.Tensor,
+    ):
+        """Tokenize, embed, and encode target lyrics/caption for FlowEdit.
+
+        The source payload contains already-embedded float 3D tensors (from
+        preprocess_batch → infer_text_embeddings / infer_lyric_embeddings).
+        We must produce the same tensor format for the target conditioning.
+
+        If target_caption is empty, reuses the source text hidden states
+        (keeps the same caption, only lyrics change).
+        """
+        from acestep.constants import SFT_GEN_PROMPT
+
+        bsz = source_lyric_hidden_states.shape[0]
+        device = source_lyric_hidden_states.device
+
+        # Target lyrics → tokenize → embed via text_encoder.embed_tokens
+        if target_lyrics.strip():
+            lyric_tokens = self.text_tokenizer(
+                target_lyrics,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=source_lyric_hidden_states.shape[1],
+            )
+            lyric_token_ids = lyric_tokens["input_ids"].to(device)
+            target_lyric_mask = lyric_tokens["attention_mask"].to(device)
+
+            with self._load_model_context("text_encoder"):
+                target_lyric_hs = self.infer_lyric_embeddings(lyric_token_ids)
+
+            target_lyric_hs = target_lyric_hs.expand(bsz, -1, -1)
+            target_lyric_mask = target_lyric_mask.expand(bsz, -1)
+        else:
+            target_lyric_hs = source_lyric_hidden_states
+            target_lyric_mask = source_lyric_attention_mask
+
+        # Target caption → tokenize → encode via text_encoder forward
+        if target_caption.strip():
+            caption_text = SFT_GEN_PROMPT.format("", target_caption, "")
+            caption_tokens = self.text_tokenizer(
+                caption_text,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=source_text_hidden_states.shape[1],
+            )
+            caption_token_ids = caption_tokens["input_ids"].to(device)
+            target_text_mask = caption_tokens["attention_mask"].to(device)
+
+            with self._load_model_context("text_encoder"):
+                target_text_hs = self.infer_text_embeddings(caption_token_ids)
+
+            target_text_hs = target_text_hs.expand(bsz, -1, -1)
+            target_text_mask = target_text_mask.expand(bsz, -1)
+        else:
+            target_text_hs = source_text_hidden_states
+            target_text_mask = source_text_attention_mask
+
+        return target_text_hs, target_text_mask, target_lyric_hs, target_lyric_mask
+
     def _build_service_generate_kwargs(
         self,
         payload: Dict[str, Any],
@@ -80,6 +148,11 @@ class ServiceGenerateExecuteMixin:
         sampler_mode: str = "euler",
         velocity_norm_threshold: float = 0.0,
         velocity_ema_factor: float = 0.0,
+        edit_target_lyrics: str = "",
+        edit_target_caption: str = "",
+        edit_n_min: float = 0.6,
+        edit_n_max: float = 1.0,
+        edit_n_avg: int = 1,
     ) -> Dict[str, Any]:
         """Build kwargs passed to model generation backends."""
         repaint_mask = payload.get("repaint_mask")
@@ -116,6 +189,11 @@ class ServiceGenerateExecuteMixin:
             "sampler_mode": sampler_mode,
             "velocity_norm_threshold": velocity_norm_threshold,
             "velocity_ema_factor": velocity_ema_factor,
+            "edit_target_lyrics": edit_target_lyrics,
+            "edit_target_caption": edit_target_caption,
+            "edit_n_min": edit_n_min,
+            "edit_n_max": edit_n_max,
+            "edit_n_avg": edit_n_avg,
         }
         if timesteps is not None:
             kwargs["timesteps"] = torch.tensor(timesteps, dtype=torch.float32, device=self.device)
@@ -217,7 +295,38 @@ class ServiceGenerateExecuteMixin:
                         logger.warning("[service_generate] MLX diffusion failed ({}); falling back to PyTorch.", exc)
                         outputs = self.model.generate_audio(**generate_kwargs)
                 else:
-                    logger.info("[service_generate] DiT diffusion via PyTorch ({})...", self.device)
-                    outputs = self.model.generate_audio(**generate_kwargs)
+                    # --- FlowEdit dispatch ---
+                    edit_target_lyrics = generate_kwargs.pop("edit_target_lyrics", "")
+                    edit_target_caption = generate_kwargs.pop("edit_target_caption", "")
+                    edit_n_min = generate_kwargs.pop("edit_n_min", 0.6)
+                    edit_n_max = generate_kwargs.pop("edit_n_max", 1.0)
+                    edit_n_avg = generate_kwargs.pop("edit_n_avg", 1)
+
+                    if edit_target_lyrics:
+                        logger.info("[service_generate] FlowEdit mode: preparing target conditioning...")
+                        target_text_hs, target_text_mask, target_lyric_hs, target_lyric_mask = (
+                            self._prepare_flowedit_target_conditioning(
+                                target_caption=edit_target_caption,
+                                target_lyrics=edit_target_lyrics,
+                                source_text_hidden_states=payload["text_hidden_states"],
+                                source_text_attention_mask=payload["text_attention_mask"],
+                                source_lyric_hidden_states=payload["lyric_hidden_states"],
+                                source_lyric_attention_mask=payload["lyric_attention_mask"],
+                            )
+                        )
+                        logger.info("[service_generate] FlowEdit: calling flowedit_audio()")
+                        outputs = self.model.flowedit_audio(
+                            **generate_kwargs,
+                            target_text_hidden_states=target_text_hs,
+                            target_text_attention_mask=target_text_mask,
+                            target_lyric_hidden_states=target_lyric_hs,
+                            target_lyric_attention_mask=target_lyric_mask,
+                            edit_n_min=edit_n_min,
+                            edit_n_max=edit_n_max,
+                            edit_n_avg=edit_n_avg,
+                        )
+                    else:
+                        logger.info("[service_generate] DiT diffusion via PyTorch ({})...", self.device)
+                        outputs = self.model.generate_audio(**generate_kwargs)
 
         return outputs, encoder_hidden_states, encoder_attention_mask, context_latents

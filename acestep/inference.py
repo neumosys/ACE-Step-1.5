@@ -152,6 +152,13 @@ class GenerationParams:
     audio_cover_strength: float = 1.0
     cover_noise_strength: float = 0.0  # 0=pure noise (no cover), 1=closest to src audio
 
+    # FlowEdit Parameters (task_type == "edit")
+    edit_target_lyrics: str = ""       # New lyrics to replace the original
+    edit_target_caption: str = ""      # Optional new caption (empty = reuse original caption)
+    edit_n_min: float = 0.6            # Start ratio: skip first N% of steps (preserve structure)
+    edit_n_max: float = 1.0            # End ratio: switch to regular denoising after this
+    edit_n_avg: int = 1                # Averaging iterations per FlowEdit step
+
     # 5Hz Language Model Parameters
     thinking: bool = True
     lm_temperature: float = 0.85
@@ -413,7 +420,7 @@ def generate_music(
         # and don't need LM to generate audio codes or metadata.
         # For extract tasks, LLM-generated captions can conflict with the extract instruction
         # and cause the DiT model to reconstruct input audio instead of extracting stems.
-        skip_lm_tasks = {"cover", "repaint", "extract"}
+        skip_lm_tasks = {"cover", "repaint", "extract", "edit"}
         
         # Determine if we should use LLM
         # LLM is needed for:
@@ -606,7 +613,7 @@ def generate_music(
         # Cover/repaint/lego/extract: duration is locked to the source audio
         # length.  Silently ignore whatever the caller passed — the handler
         # will set audio_duration from the loaded waveform.
-        if params.task_type in ("cover", "repaint", "lego", "extract"):
+        if params.task_type in ("cover", "repaint", "lego", "extract", "edit"):
             audio_duration = None
 
         # Phase 2: DiT music generation
@@ -653,6 +660,11 @@ def generate_music(
             "latent_shift": params.latent_shift,
             "latent_rescale": params.latent_rescale,
             "progress": progress,
+            "edit_target_lyrics": params.edit_target_lyrics,
+            "edit_target_caption": params.edit_target_caption,
+            "edit_n_min": params.edit_n_min,
+            "edit_n_max": params.edit_n_max,
+            "edit_n_avg": params.edit_n_avg,
         }
         supported_generate_keys = set(inspect.signature(dit_handler.generate_music).parameters.keys())
         filtered_generate_kwargs = {

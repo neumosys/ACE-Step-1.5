@@ -203,6 +203,8 @@ def generate_instruction(
             return TASK_INSTRUCTIONS["complete"].format(TRACK_CLASSES=track_classes_str)
         else:
             return TASK_INSTRUCTIONS["complete_default"]
+    elif task_type == "edit":
+        return TASK_INSTRUCTIONS["edit"]
     else:
         return TASK_INSTRUCTIONS["text2music"]
 
@@ -393,7 +395,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         # IMPORTANT: Disable thinking (LLM audio code generation) for tasks that use src_audio directly.
         # When thinking=True, LLM generates audio codes which causes src_audio to be ignored in handler.py.
         # For complete/lego/extract tasks, we need the actual source audio, not LLM-generated codes.
-        if task_type in BASE_MODEL_TASKS:
+        if task_type in BASE_MODEL_TASKS or task_type == "edit":
             thinking = False
 
         lm_temperature = float(job_input.get("lm_temperature", 0.85))
@@ -439,6 +441,13 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         # Auto LRC generation
         auto_lrc = job_input.get("auto_lrc", False)
 
+        # FlowEdit parameters (task_type == "edit")
+        edit_target_lyrics = job_input.get("edit_target_lyrics", "")
+        edit_target_caption = job_input.get("edit_target_caption", "")
+        edit_n_min = float(job_input.get("edit_n_min", 0.6))
+        edit_n_max = float(job_input.get("edit_n_max", 1.0))
+        edit_n_avg = int(job_input.get("edit_n_avg", 1))
+
         # Output mode for lego/complete tasks
         output_mode = job_input.get("output_mode", "stems")  # "stems" or "mixed"
         mix_volume_source = float(job_input.get("mix_volume_source", 1.0))
@@ -450,7 +459,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             instruction = generate_instruction(task_type, track_name, complete_track_classes)
 
         # Validation
-        if task_type in ["cover", "repaint", "lego", "extract", "complete"] and not src_audio and not reference_audio:
+        if task_type in ["cover", "repaint", "lego", "extract", "complete", "edit"] and not src_audio and not reference_audio:
             return {"error": f"Task '{task_type}' requires 'src_audio' or 'reference_audio'."}
 
         # Handle understand task separately (no audio generation)
@@ -530,6 +539,11 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             repainting_end=repainting_end,
             audio_cover_strength=audio_cover_strength,
             instruction=instruction,
+            edit_target_lyrics=edit_target_lyrics,
+            edit_target_caption=edit_target_caption,
+            edit_n_min=edit_n_min,
+            edit_n_max=edit_n_max,
+            edit_n_avg=edit_n_avg,
         )
 
         # Build GenerationConfig
